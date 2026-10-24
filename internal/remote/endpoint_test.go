@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -286,6 +287,44 @@ func TestEndpointRequestsResyncWhenRunningSubscriptionFallsBehind(t *testing.T) 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("resync event was not emitted")
+	}
+}
+
+func TestEndpointSubscriptionCleanupPaths(t *testing.T) {
+	endpoint := &Endpoint{
+		channels: make(map[string]security.Channel),
+		subs:     make(map[string]*activeSubscription),
+	}
+	if _, err := endpoint.Encrypt("missing", protocol.Envelope{}); err == nil {
+		t.Fatal("encryption succeeded without an established channel")
+	}
+	endpoint.Revoke("missing")
+
+	ctx := context.Background()
+	canceled := make(chan struct{})
+	var cancelOnce sync.Once
+	endpoint.Activate(ctx, "device", &Subscription{
+		SessionID: "session", Chunks: make(chan session.Chunk),
+		Cancel: func() { cancelOnce.Do(func() { close(canceled) }) },
+	}, func(protocol.Envelope) error { return nil })
+	endpoint.Activate(ctx, "device", nil, func(protocol.Envelope) error { return nil })
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("subscription was not canceled when cleared")
+	}
+
+	emitCanceled := make(chan struct{})
+	chunks := make(chan session.Chunk, 1)
+	chunks <- session.Chunk{Sequence: 1, Data: []byte("output")}
+	endpoint.Activate(ctx, "device", &Subscription{
+		SessionID: "session", Chunks: chunks,
+		Cancel: func() { close(emitCanceled) },
+	}, func(protocol.Envelope) error { return errors.New("send failed") })
+	select {
+	case <-emitCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("subscription was not canceled after an emit failure")
 	}
 }
 
