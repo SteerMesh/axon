@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/SteerMesh/axon/internal/domain"
@@ -137,5 +138,27 @@ func TestUnstartedPTYProcessErrors(t *testing.T) {
 	}
 	if code, err := process.Wait(); code != -1 || err == nil {
 		t.Fatalf("wait result code=%d err=%v", code, err)
+	}
+}
+
+type fixedReader struct {
+	data []byte
+	err  error
+}
+
+func (r fixedReader) Read(buffer []byte) (int, error) {
+	return copy(buffer, r.data), r.err
+}
+
+func TestPTYReaderNormalizesLinuxEIO(t *testing.T) {
+	reader := ptyReader{Reader: fixedReader{data: []byte("done"), err: syscall.EIO}}
+	buffer := make([]byte, 8)
+	n, err := reader.Read(buffer)
+	if n != 4 || err != io.EOF || string(buffer[:n]) != "done" {
+		t.Fatalf("n=%d err=%v data=%q", n, err, buffer[:n])
+	}
+	reader = ptyReader{Reader: fixedReader{err: io.ErrUnexpectedEOF}}
+	if _, err := reader.Read(buffer); err != io.ErrUnexpectedEOF {
+		t.Fatalf("unexpected error normalization: %v", err)
 	}
 }

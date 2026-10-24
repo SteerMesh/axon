@@ -4,6 +4,7 @@ package target
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -61,7 +62,19 @@ type ptyProcess struct {
 
 func (p *ptyProcess) Write(data []byte) (int, error) { return p.file.Write(data) }
 func (p *ptyProcess) Close() error                   { return p.file.Close() }
-func (p *ptyProcess) Output() io.Reader              { return p.file }
+func (p *ptyProcess) Output() io.Reader              { return ptyReader{Reader: p.file} }
+
+// Linux PTYs report EIO when the slave side closes. For consumers this is the
+// normal end of the output stream, not a failed session.
+type ptyReader struct{ io.Reader }
+
+func (r ptyReader) Read(buffer []byte) (int, error) {
+	n, err := r.Reader.Read(buffer)
+	if errors.Is(err, syscall.EIO) {
+		return n, io.EOF
+	}
+	return n, err
+}
 
 func (p *ptyProcess) Resize(cols, rows uint16) error {
 	if cols == 0 || rows == 0 {
