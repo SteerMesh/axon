@@ -26,6 +26,8 @@ app.innerHTML = `
     <article class="terminal-panel">
       <div id="terminal" aria-label="Terminal output"></div>
       <div class="shortcuts" aria-label="Terminal shortcuts">
+        <button type="button" data-action="terminal-bottom">Terminal ↓</button>
+        <button type="button" data-action="controls">Controls ↓</button>
         <button type="button" data-sequence="\u001b">Esc</button>
         <button type="button" data-sequence="\t">Tab</button>
         <button type="button" data-sequence="\u0003">Ctrl-C</button>
@@ -80,6 +82,16 @@ new ResizeObserver(() => fit.fit()).observe(document.querySelector('#terminal')!
 
 document.querySelectorAll<HTMLButtonElement>('[data-sequence]').forEach((button) => {
   button.addEventListener('click', () => sendInput(button.dataset.sequence ?? '', true));
+});
+
+document.querySelector<HTMLButtonElement>('[data-action="terminal-bottom"]')!.addEventListener('click', () => {
+  terminal.scrollToBottom();
+  terminal.focus();
+});
+
+document.querySelector<HTMLButtonElement>('[data-action="controls"]')!.addEventListener('click', () => {
+  document.querySelector<HTMLElement>('#composer')!.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.querySelector<HTMLTextAreaElement>('#prompt')!.focus({ preventScroll: true });
 });
 
 terminal.onData((data) => sendInput(data, false));
