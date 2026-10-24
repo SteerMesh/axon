@@ -78,7 +78,15 @@ let axonClient: AxonClient | undefined;
 let activeSessionId = '';
 let nextSequence = 0;
 
-new ResizeObserver(() => fit.fit()).observe(document.querySelector('#terminal')!);
+let fitFrame = 0;
+const scheduleFit = (): void => {
+  cancelAnimationFrame(fitFrame);
+  fitFrame = requestAnimationFrame(() => fit.fit());
+};
+
+window.addEventListener('resize', scheduleFit, { passive: true });
+window.visualViewport?.addEventListener('resize', scheduleFit, { passive: true });
+scheduleFit();
 
 document.querySelectorAll<HTMLButtonElement>('[data-sequence]').forEach((button) => {
   button.addEventListener('click', () => sendInput(button.dataset.sequence ?? '', true));
