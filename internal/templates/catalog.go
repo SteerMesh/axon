@@ -21,6 +21,26 @@ type Template struct {
 	Permission domain.Permission `yaml:"permission"`
 }
 
+func DefaultCatalog() Catalog {
+	return Catalog{Templates: map[string]Template{
+		"mesh": {
+			Target:     "mesh",
+			Permission: domain.PermissionInteractive,
+		},
+	}}
+}
+
+func (c Catalog) Merge(overrides Catalog) Catalog {
+	merged := Catalog{Templates: make(map[string]Template, len(c.Templates)+len(overrides.Templates))}
+	for name, template := range c.Templates {
+		merged.Templates[name] = template
+	}
+	for name, template := range overrides.Templates {
+		merged.Templates[name] = template
+	}
+	return merged
+}
+
 func Load(path string) (Catalog, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

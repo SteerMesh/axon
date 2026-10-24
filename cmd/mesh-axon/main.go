@@ -86,6 +86,7 @@ func newServeCommand() *cobra.Command {
 			defer persistent.Close()
 			manager := session.NewManager(
 				session.DefaultScrollbackBytes,
+				target.NewCommandAdapter("mesh", "mesh", "chat"),
 				target.NewShellAdapter("zsh", "/bin/zsh"),
 				target.NewShellAdapter("bash", "/bin/bash"),
 				target.NewCommandAdapter("claude", "claude"),
@@ -111,16 +112,18 @@ func newServeCommand() *cobra.Command {
 					return fmt.Errorf("--relay-token or AXON_RELAY_TOKEN is required with --relay-url")
 				}
 				dispatcher := remote.NewDispatcher(manager, persistent)
+				catalog := templates.DefaultCatalog()
 				templatePath := filepath.Join(dataDir, "templates.yaml")
 				if _, statErr := os.Stat(templatePath); statErr == nil {
-					catalog, loadErr := templates.Load(templatePath)
+					configured, loadErr := templates.Load(templatePath)
 					if loadErr != nil {
 						return loadErr
 					}
-					dispatcher.WithTemplates(catalog)
+					catalog = catalog.Merge(configured)
 				} else if !errors.Is(statErr, os.ErrNotExist) {
 					return statErr
 				}
+				dispatcher.WithTemplates(catalog)
 				endpoint := remote.NewEndpoint(mateID, identity, persistent, dispatcher).WithPairing(pairing)
 				connector := remote.NewConnector(relayURL, relayToken, mateID, endpoint)
 				go func() {
@@ -144,9 +147,8 @@ func newServeCommand() *cobra.Command {
 func newRunCommand() *cobra.Command {
 	var name, cwd, permission string
 	command := &cobra.Command{
-		Use:   "run <zsh|bash> [args...]",
+		Use:   "run [mesh|zsh|bash|target] [args...]",
 		Short: "Create a managed PTY session",
-		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			perm := domain.Permission(permission)
 			switch perm {
@@ -154,11 +156,17 @@ func newRunCommand() *cobra.Command {
 			default:
 				return fmt.Errorf("invalid permission %q", permission)
 			}
+			targetKind := "mesh"
+			var targetArgs []string
+			if len(args) > 0 {
+				targetKind = args[0]
+				targetArgs = args[1:]
+			}
 			params := ipc.CreateParams{
 				Name: name,
 				Target: domain.TargetSpec{
-					Kind: args[0],
-					Args: args[1:],
+					Kind: targetKind,
+					Args: targetArgs,
 					Cwd:  cwd,
 				},
 				Permission: perm,

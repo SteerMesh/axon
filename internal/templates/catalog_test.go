@@ -58,3 +58,24 @@ func TestCatalogResolveReturnsDefensiveCopies(t *testing.T) {
 		t.Fatalf("catalog mutated: %+v", second)
 	}
 }
+
+func TestDefaultCatalogStartsMeshChatAndSupportsOverrides(t *testing.T) {
+	catalog := DefaultCatalog()
+	spec, permission, err := catalog.Resolve("mesh")
+	if err != nil || spec.Kind != "mesh" || len(spec.Args) != 0 || permission != "interactive" {
+		t.Fatalf("unexpected default mesh template: %+v, %q, %v", spec, permission, err)
+	}
+
+	override := Catalog{Templates: map[string]Template{
+		"mesh":  {Target: "mesh", Args: []string{"--target", "codex"}, Permission: "approve_to_type"},
+		"shell": {Target: "bash", Permission: "interactive"},
+	}}
+	merged := catalog.Merge(override)
+	mesh, permission, _ := merged.Resolve("mesh")
+	if len(mesh.Args) != 2 || mesh.Args[1] != "codex" || permission != "approve_to_type" {
+		t.Fatalf("mesh override was not applied: %+v, %q", mesh, permission)
+	}
+	if _, _, err := merged.Resolve("shell"); err != nil {
+		t.Fatalf("additional template was not preserved: %v", err)
+	}
+}

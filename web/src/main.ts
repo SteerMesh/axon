@@ -127,7 +127,14 @@ document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('subm
 		state.textContent = 'Encrypted';
 		terminal.writeln(`\r\nPaired with ${secureConnection.mateId}.`);
 		const response = await axonClient.request<Array<{ id: string; name: string; state: string }>>('sessions.list');
-		const sessions = response.data ?? [];
+		let sessions = response.data ?? [];
+		if (sessions.length === 0) {
+			const created = await axonClient.request<{ id: string; name: string; state: string }>(
+				'session.create',
+				{ template: 'mesh', name: 'mesh' },
+			);
+			if (created.data) sessions = [created.data];
+		}
 		activeSessionId = sessions[0]?.id ?? '';
 		terminal.writeln(`Sessions: ${sessions.map((session) => `${session.name} (${session.state})`).join(', ') || 'none'}`);
 		if (activeSessionId) void replayLoop(activeSessionId);

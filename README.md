@@ -1,7 +1,8 @@
 # Mesh Axon
 
-Mesh Axon securely connects mobile devices to Mesh-managed terminal and agent
-sessions. The host-side Axon Agent owns PTYs, Axon Relay forwards opaque
+Mesh Axon securely connects mobile devices to Mesh-managed agent sessions. The
+default remote entry point is `mesh chat`; raw terminal sessions are an explicit
+diagnostic option. The host-side Axon Agent owns PTYs, Axon Relay forwards opaque
 end-to-end encrypted frames, and the Axon web client provides a mobile-first
 terminal and prompt composer.
 
@@ -32,8 +33,16 @@ Start the local agent:
 
 ```bash
 ./bin/mesh-axon serve
-./bin/mesh-axon run zsh --name demo
+./bin/mesh-axon run --name demo
 ./bin/mesh-axon sessions
+```
+
+The default command starts `mesh chat`. To request a specific runtime or open a
+raw diagnostic shell:
+
+```bash
+./bin/mesh-axon run --name codex-demo mesh -- --target codex
+./bin/mesh-axon run zsh --name shell-debug
 ```
 
 ## Security
