@@ -153,6 +153,44 @@ func TestDispatcherListsMeshOptionsAndCreatesConfiguredMeshSession(t *testing.T)
 	}
 }
 
+func TestDispatcherSubscribeFailures(t *testing.T) {
+	dispatcher := NewDispatcher(session.NewManager(1024), nil)
+	viewer := DeviceContext{ID: "viewer", Role: authz.RoleViewer}
+	tests := []struct {
+		name string
+		req  protocol.Envelope
+		code string
+	}{
+		{
+			name: "invalid envelope",
+			req:  protocol.Envelope{Version: 0, ID: "invalid", Type: "session.subscribe", SessionID: "missing", Timestamp: time.Now()},
+			code: "invalid_message",
+		},
+		{
+			name: "invalid data",
+			req:  protocol.Envelope{Version: 1, ID: "invalid-data", Type: "session.subscribe", SessionID: "missing", Timestamp: time.Now(), Data: json.RawMessage("{")},
+			code: "invalid_message",
+		},
+		{
+			name: "missing session",
+			req:  requestEnvelope("session.subscribe", "missing", "missing", map[string]any{"from_seq": 0}),
+			code: "not_found",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response, subscription := dispatcher.Subscribe(context.Background(), viewer, test.req)
+			if subscription != nil {
+				t.Fatal("failed subscription returned a live capability")
+			}
+			var got protocol.Error
+			if response.Type != "error" || json.Unmarshal(response.Data, &got) != nil || got.Code != test.code {
+				t.Fatalf("response = %+v, error = %+v", response, got)
+			}
+		})
+	}
+}
+
 func requestEnvelope(kind, sessionID, id string, body any) protocol.Envelope {
 	data, _ := json.Marshal(body)
 	request := protocol.Envelope{Version: 1, ID: id, Type: kind, SessionID: sessionID, Timestamp: time.Now(), Data: data}

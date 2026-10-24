@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -207,6 +208,85 @@ func TestEndpointDropsInvalidAndRevokedEstablishedChannels(t *testing.T) {
 		t.Fatalf("revoked established channel accepted: %v", err)
 	}
 	endpoint.Revoke(device)
+}
+
+func TestEndpointPushesOutputAndClosureAndReplacesSubscription(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	endpoint := &Endpoint{subs: make(map[string]*activeSubscription)}
+	events := make(chan protocol.Envelope, 4)
+	emit := func(event protocol.Envelope) error {
+		events <- event
+		return nil
+	}
+
+	firstCanceled := make(chan struct{})
+	var firstCancelOnce sync.Once
+	firstChunks := make(chan session.Chunk)
+	endpoint.Activate(ctx, "device", &Subscription{
+		SessionID: "first", Epoch: "epoch-1", Chunks: firstChunks,
+		Cancel: func() { firstCancelOnce.Do(func() { close(firstCanceled) }) },
+	}, emit)
+
+	secondCanceled := make(chan struct{})
+	var secondCancelOnce sync.Once
+	secondChunks := make(chan session.Chunk, 1)
+	endpoint.Activate(ctx, "device", &Subscription{
+		SessionID: "second", Epoch: "epoch-2", Chunks: secondChunks,
+		Cancel: func() { secondCancelOnce.Do(func() { close(secondCanceled) }) },
+	}, emit)
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("replaced subscription was not canceled")
+	}
+
+	secondChunks <- session.Chunk{Sequence: 7, Data: []byte("live")}
+	close(secondChunks)
+	output := <-events
+	closed := <-events
+	var data []byte
+	if err := json.Unmarshal(output.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if output.Type != "session.output" || output.SessionID != "second" || output.Epoch != "epoch-2" || output.Sequence != 7 || string(data) != "live" {
+		t.Fatalf("unexpected output event: %+v data=%q", output, data)
+	}
+	if closed.Type != "session.closed" || closed.SessionID != "second" || closed.Epoch != "epoch-2" {
+		t.Fatalf("unexpected closed event: %+v", closed)
+	}
+	select {
+	case <-secondCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("completed subscription was not canceled")
+	}
+}
+
+func TestEndpointRequestsResyncWhenRunningSubscriptionFallsBehind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	endpoint := &Endpoint{subs: make(map[string]*activeSubscription)}
+	events := make(chan protocol.Envelope, 1)
+	chunks := make(chan session.Chunk)
+	close(chunks)
+
+	endpoint.Activate(ctx, "device", &Subscription{
+		SessionID: "running", Epoch: "epoch-1", Chunks: chunks,
+		State:  func() domain.SessionState { return domain.StateRunning },
+		Cancel: func() {},
+	}, func(event protocol.Envelope) error {
+		events <- event
+		return nil
+	})
+
+	select {
+	case event := <-events:
+		if event.Type != "session.resync" || event.SessionID != "running" || event.Epoch != "epoch-1" {
+			t.Fatalf("unexpected resync event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resync event was not emitted")
+	}
 }
 
 func pairedEndpoint(t *testing.T) (*Endpoint, *store.Store, string, security.Channel) {

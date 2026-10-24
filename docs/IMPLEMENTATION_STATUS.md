@@ -17,12 +17,13 @@ protocol validation, but it is not yet a production release.
 - Content-blind WebSocket relay routing.
 - Mobile-first installable PWA with terminal rendering, prompt composition,
   IndexedDB-held non-extractable keys, pairing, and encrypted command exchange.
+- Encrypted session subscriptions with one atomic replay snapshot followed by
+  server-pushed ordered output and terminal-closure events.
 - Cross-language Go and TypeScript Noise interoperability tests.
 - LaunchAgent and systemd user-service generation.
 
 ## Production hardening remaining
 
-- Replace PWA replay polling with encrypted server-pushed output events.
 - Persist paired Mate connection metadata in the PWA and add a session picker.
 - Implement Web Push subscription delivery from the host or notification
   service.

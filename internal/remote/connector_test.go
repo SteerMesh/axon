@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/authz"
+	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/relay"
 	"github.com/SteerMesh/axon/internal/security"
 	"github.com/SteerMesh/axon/internal/session"
@@ -39,7 +41,13 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 	if err := persistent.PutDevice(ctx, record, authz.RoleViewer); err != nil {
 		t.Fatal(err)
 	}
-	manager := session.NewManager(1024)
+	r, w := io.Pipe()
+	defer w.Close()
+	manager := session.NewManager(1024, endpointAdapter{process: &endpointProcess{r: r}})
+	managed, err := manager.Create(ctx, "push-test", domain.TargetSpec{Kind: "test"}, domain.PermissionInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
 	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(manager, persistent))
 	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
 	go func() { _ = connector.Run(ctx) }()
@@ -80,6 +88,41 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 	}
 	if response.ReplyTo != request.ID {
 		t.Fatalf("unexpected response: %+v", response)
+	}
+
+	subscribe := requestEnvelope("session.subscribe", managed.ID, "subscribe-1", map[string]any{"from_seq": 0})
+	encoded, _ = json.Marshal(subscribe)
+	encrypted, _ = channel.Send.Encrypt(nil, nil, encoded)
+	reply = exchangeRoute(t, ctx, conn, append([]byte{packetTransport}, encrypted...))
+	plaintext, err = channel.Recv.Decrypt(nil, nil, reply[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(plaintext, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ReplyTo != subscribe.ID || response.Epoch != managed.StreamEpoch {
+		t.Fatalf("unexpected subscription response: %+v", response)
+	}
+
+	if _, err := w.Write([]byte("pushed-output")); err != nil {
+		t.Fatal(err)
+	}
+	eventPacket := readRoute(t, ctx, conn)
+	plaintext, err = channel.Recv.Decrypt(nil, nil, eventPacket[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event protocol.Envelope
+	if err := json.Unmarshal(plaintext, &event); err != nil {
+		t.Fatal(err)
+	}
+	var output []byte
+	if err := json.Unmarshal(event.Data, &output); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "session.output" || event.SessionID != managed.ID || event.Sequence != 1 || string(output) != "pushed-output" {
+		t.Fatalf("unexpected pushed event: %+v output=%q", event, output)
 	}
 }
 
@@ -125,6 +168,11 @@ func exchangeRoute(t *testing.T, ctx context.Context, conn *websocket.Conn, payl
 	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
 		t.Fatal(err)
 	}
+	return readRoute(t, ctx, conn)
+}
+
+func readRoute(t *testing.T, ctx context.Context, conn *websocket.Conn) []byte {
+	t.Helper()
 	_, data, err := conn.Read(ctx)
 	if err != nil {
 		t.Fatal(err)

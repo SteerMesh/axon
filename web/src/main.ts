@@ -101,6 +101,8 @@ terminal.writeln('Pair a device to begin.');
 let secureConnection: Awaited<ReturnType<typeof pairAndConnect>> | undefined;
 let axonClient: AxonClient | undefined;
 let activeSessionId = '';
+let activeEpoch = '';
+let nextSequence = 0;
 let sessions: SessionSummary[] = [];
 
 let fitFrame = 0;
@@ -177,6 +179,24 @@ document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('subm
 		secureConnection = paired;
 		activeSessionId = '';
 		axonClient = new AxonClient(secureConnection.transport);
+		axonClient.on<string>('session.output', (event) => {
+			if (event.sid !== activeSessionId || (activeEpoch && event.epoch !== activeEpoch)) return;
+			if (event.seq === undefined || event.seq < nextSequence || !event.data) return;
+			terminal.write(fromBase64Text(event.data));
+			nextSequence = event.seq + 1;
+		});
+		axonClient.on('session.closed', (event) => {
+			if (event.sid !== activeSessionId) return;
+			terminal.writeln('\r\n\x1b[33mSession finished.\x1b[0m');
+			const session = sessions.find((candidate) => candidate.id === event.sid);
+			if (session) session.state = 'finished';
+			renderSessions();
+		});
+		axonClient.on('session.resync', (event) => {
+			if (event.sid !== activeSessionId || (activeEpoch && event.epoch !== activeEpoch)) return;
+			terminal.writeln('\r\n\x1b[33mLive output fell behind; resynchronizing…\x1b[0m');
+			void subscribeSession(event.sid, nextSequence);
+		});
 		state.textContent = 'Encrypted';
 		terminal.writeln(`\r\nPaired with ${secureConnection.mateId}.`);
 		await loadMeshOptions();
@@ -253,39 +273,40 @@ function renderSessions(): void {
 function selectSession(session: SessionSummary): void {
   if (activeSessionId === session.id) return;
   activeSessionId = session.id;
+  activeEpoch = '';
+  nextSequence = 0;
   renderSessions();
   terminal.reset();
   terminal.writeln(`\x1b[38;2;84;230;177m${session.name}\x1b[0m · ${session.target.kind}`);
   scheduleFit();
-  void replayLoop(session.id);
+  void subscribeSession(session.id);
 }
 
-async function replayLoop(sessionId: string): Promise<void> {
-	let nextSequence = 0;
-	while (axonClient && activeSessionId === sessionId) {
-		try {
-			const response = await axonClient.request<{
-				chunks?: Array<{ seq: number; data: string }>;
-				min_seq: number;
-				max_seq: number;
-				gap: boolean;
-			}>('session.replay', { from_seq: nextSequence }, sessionId);
-			if (activeSessionId !== sessionId) return;
-			const replay = response.data;
-			if (replay?.gap) {
-				terminal.writeln(`\r\n\x1b[33mOutput before sequence ${replay.min_seq} is no longer retained.\x1b[0m`);
-				nextSequence = replay.min_seq;
-			} else {
-				for (const chunk of replay?.chunks ?? []) {
-					terminal.write(fromBase64Text(chunk.data));
-					nextSequence = chunk.seq + 1;
-				}
-			}
-		} catch (error) {
-			terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+async function subscribeSession(sessionId: string, fromSequence = 0): Promise<void> {
+	if (!axonClient || activeSessionId !== sessionId) return;
+	try {
+		const response = await axonClient.request<{
+			chunks?: Array<{ seq: number; data: string }>;
+			min_seq: number;
+			max_seq: number;
+			gap: boolean;
+		}>('session.subscribe', { from_seq: fromSequence }, sessionId);
+		if (activeSessionId !== sessionId) return;
+		activeEpoch = response.epoch ?? '';
+		const replay = response.data;
+		if (replay?.gap) {
+			terminal.writeln(`\r\n\x1b[33mOutput before sequence ${replay.min_seq} is no longer retained.\x1b[0m`);
+			nextSequence = replay.min_seq;
+			await subscribeSession(sessionId, replay.min_seq);
 			return;
 		}
-		await new Promise((resolve) => setTimeout(resolve, 250));
+		for (const chunk of replay?.chunks ?? []) {
+			if (chunk.seq < nextSequence) continue;
+			terminal.write(fromBase64Text(chunk.data));
+			nextSequence = chunk.seq + 1;
+		}
+	} catch (error) {
+		terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
 	}
 }
 

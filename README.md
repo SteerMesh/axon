@@ -47,8 +47,10 @@ raw diagnostic shell:
 
 After pairing, the web client lists every live session owned by the Axon Agent.
 Select a session to attach to its retained output and continue interacting with
-its process. The **New Mesh chat** form discovers installed Mesh workspaces and
-offers the runtimes supported by `mesh chat --target`.
+its process. The initial retained output is followed by encrypted server-pushed
+terminal events without replay polling. The **New Mesh chat** form discovers
+installed Mesh workspaces and offers the runtimes supported by
+`mesh chat --target`.
 
 Axon cannot adopt an arbitrary process started in another terminal because it
 does not own that process's PTY. Start the process through Axon, or use the

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/relay"
+	"github.com/SteerMesh/axon/pkg/protocol"
 	"github.com/coder/websocket"
 )
 
@@ -97,24 +98,47 @@ func (c *Connector) runOnce(ctx context.Context) error {
 		if err := json.Unmarshal(data, &frame); err != nil || frame.From == "" {
 			continue
 		}
-		response, err := c.endpoint.Process(ctx, frame.From, frame.Payload)
+		outbound, err := c.endpoint.Handle(ctx, frame.From, frame.Payload)
 		if err != nil {
 			slog.Warn("Rejected remote frame", "device_id", frame.From, "error", err)
 			continue
 		}
-		if err := c.Send(ctx, frame.From, response); err != nil {
+		if outbound.Envelope != nil {
+			if err := c.sendEnvelope(ctx, frame.From, *outbound.Envelope); err != nil {
+				return err
+			}
+			if outbound.Subscription != nil {
+				c.endpoint.Activate(ctx, frame.From, outbound.Subscription, func(event protocol.Envelope) error {
+					return c.sendEnvelope(ctx, frame.From, event)
+				})
+			}
+		} else if err := c.Send(ctx, frame.From, outbound.Packet); err != nil {
 			return err
 		}
 	}
 }
 
 func (c *Connector) Send(ctx context.Context, deviceID string, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.sendLocked(ctx, deviceID, payload)
+}
+
+func (c *Connector) sendEnvelope(ctx context.Context, deviceID string, envelope protocol.Envelope) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	payload, err := c.endpoint.Encrypt(deviceID, envelope)
+	if err != nil {
+		return err
+	}
+	return c.sendLocked(ctx, deviceID, payload)
+}
+
+func (c *Connector) sendLocked(ctx context.Context, deviceID string, payload []byte) error {
 	frame, err := json.Marshal(relay.RouteFrame{Version: 1, MateID: c.mateID, From: "mate", To: deviceID, Payload: payload})
 	if err != nil {
 		return err
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	if c.conn == nil {
 		return fmt.Errorf("relay is not connected")
 	}
