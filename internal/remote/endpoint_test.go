@@ -92,6 +92,43 @@ func TestEndpointAuthenticatesAndDispatchesEncryptedRequest(t *testing.T) {
 	}
 }
 
+func TestEndpointRepairingDeviceReplacesEstablishedChannel(t *testing.T) {
+	ctx := context.Background()
+	endpoint, persistent, deviceID, _ := pairedEndpoint(t)
+	defer persistent.Close()
+
+	device, err := security.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairing := security.NewPairingManager("mate-1", "wss://relay.example", endpoint.identity)
+	endpoint.WithPairing(pairing)
+	bundle, err := pairing.Issue(5 * time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := security.SignPresentation(bundle.OneTimeToken, bundle.MateID, device, deviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairRequest, _ := json.Marshal(map[string]any{"token": bundle.OneTimeToken, "presentation": presentation})
+	if _, err := endpoint.Process(ctx, deviceID, append([]byte{packetPairingInit}, pairRequest...)); err != nil {
+		t.Fatal(err)
+	}
+
+	initiator, err := security.NewIKInitiator(device.Noise, endpoint.identity.Noise.Public, []byte("mesh-axon-v1:mate-1:"+deviceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := initiator.Start([]byte(deviceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := endpoint.Process(ctx, deviceID, append([]byte{packetHandshakeInit}, first...)); err != nil {
+		t.Fatalf("replacement handshake failed: %v", err)
+	}
+}
+
 func TestEndpointRejectsInvalidProtocolStates(t *testing.T) {
 	ctx := context.Background()
 	mate, _ := security.GenerateIdentity()

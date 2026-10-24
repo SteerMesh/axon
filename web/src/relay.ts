@@ -65,21 +65,23 @@ export class RelayTransport {
 }
 
 export class SecureTransport {
-  readonly #relay: RelayTransport;
+  readonly #relay: Pick<RelayTransport, 'send' | 'receive' | 'close'>;
   readonly #channel: NoiseChannel;
 
-  constructor(relay: RelayTransport, channel: NoiseChannel) {
+  constructor(relay: Pick<RelayTransport, 'send' | 'receive' | 'close'>, channel: NoiseChannel) {
     this.#relay = relay;
     this.#channel = channel;
   }
 
   send(message: unknown): void {
-    this.#relay.send(this.#channel.encrypt(new TextEncoder().encode(JSON.stringify(message))));
+    const ciphertext = this.#channel.encrypt(new TextEncoder().encode(JSON.stringify(message)));
+    this.#relay.send(packet(3, ciphertext));
   }
 
   async receive<T>(): Promise<T> {
-    const encrypted = await this.#relay.receive();
-    return JSON.parse(new TextDecoder().decode(this.#channel.decrypt(encrypted))) as T;
+    const framed = await this.#relay.receive();
+    if (framed[0] !== 3) throw new Error('relay sent an invalid encrypted transport packet');
+    return JSON.parse(new TextDecoder().decode(this.#channel.decrypt(framed.slice(1)))) as T;
   }
 
 	close(): void {
@@ -100,4 +102,11 @@ export function base64URL(value: Uint8Array): string {
 export function fromBase64(value: string): Uint8Array {
   const binary = atob(value);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function packet(kind: number, payload: Uint8Array): Uint8Array {
+  const result = new Uint8Array(payload.length + 1);
+  result[0] = kind;
+  result.set(payload, 1);
+  return result;
 }
