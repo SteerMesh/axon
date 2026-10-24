@@ -87,7 +87,7 @@ func newServeCommand() *cobra.Command {
 			defer persistent.Close()
 			manager := session.NewManager(
 				session.DefaultScrollbackBytes,
-				target.NewCommandAdapter("mesh", "mesh", "chat"),
+				target.NewCommandAdapter("mesh", "mesh", "chat").WithEnv("MESH_AXON_MANAGED", "1"),
 				target.NewShellAdapter("zsh", "/bin/zsh"),
 				target.NewShellAdapter("bash", "/bin/bash"),
 				target.NewCommandAdapter("claude", "claude"),
@@ -152,6 +152,7 @@ func newServeCommand() *cobra.Command {
 
 func newRunCommand() *cobra.Command {
 	var name, cwd, permission string
+	var attachCreated bool
 	command := &cobra.Command{
 		Use:   "run [mesh|zsh|bash|target] [args...]",
 		Short: "Create a managed PTY session",
@@ -181,6 +182,9 @@ func newRunCommand() *cobra.Command {
 			if err := ipc.NewClient(socketPath).Call("session.create", params, &created); err != nil {
 				return agentUnavailable(err)
 			}
+			if attachCreated {
+				return attach(socketPath, created.ID, 0)
+			}
 			fmt.Printf("%s\t%s\t%s\n", created.ID, created.Name, created.State)
 			return nil
 		},
@@ -188,6 +192,7 @@ func newRunCommand() *cobra.Command {
 	command.Flags().StringVar(&name, "name", "", "Unique session name")
 	command.Flags().StringVar(&cwd, "cwd", "", "Initial working directory")
 	command.Flags().StringVar(&permission, "permission", string(domain.PermissionInteractive), "interactive, read_only, or approve_to_type")
+	command.Flags().BoolVar(&attachCreated, "attach", false, "Attach this terminal after creating the session")
 	return command
 }
 

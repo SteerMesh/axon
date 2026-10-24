@@ -101,6 +101,24 @@ func TestCommandAdapterValidationAndSignalErrors(t *testing.T) {
 	_, _ = process.Wait()
 }
 
+func TestCommandAdapterTrustedEnvironment(t *testing.T) {
+	adapter := NewCommandAdapter("env", "/bin/sh", "-c").WithEnv("AXON_TEST_MANAGED", "trusted")
+	process, err := adapter.Spawn(context.Background(), domain.TargetSpec{
+		Args: []string{"printf %s \"$AXON_TEST_MANAGED\""},
+		Env:  map[string]string{"AXON_TEST_MANAGED": "untrusted"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(process.Output())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, err := process.Wait(); err != nil || code != 0 || !strings.Contains(string(output), "trusted") {
+		t.Fatalf("command result code=%d output=%q err=%v", code, output, err)
+	}
+}
+
 func TestPTYWriteAndClose(t *testing.T) {
 	process, err := NewCommandAdapter("cat", "/bin/cat").Spawn(context.Background(), domain.TargetSpec{})
 	if err != nil {

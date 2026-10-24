@@ -15,7 +15,18 @@ type CommandAdapter struct {
 	kind       string
 	executable string
 	prefixArgs []string
+	env        map[string]string
 	validator  func(domain.TargetSpec) error
+}
+
+// WithEnv adds a trusted environment variable to every process spawned by
+// this adapter. Adapter values take precedence over caller-supplied values.
+func (a *CommandAdapter) WithEnv(key, value string) *CommandAdapter {
+	if a.env == nil {
+		a.env = make(map[string]string)
+	}
+	a.env[key] = value
+	return a
 }
 
 func NewCommandAdapter(kind, executable string, prefixArgs ...string) *CommandAdapter {
@@ -34,6 +45,16 @@ func (a *CommandAdapter) Spawn(ctx context.Context, spec domain.TargetSpec) (Pro
 		if err := a.validator(spec); err != nil {
 			return nil, err
 		}
+	}
+	if len(a.env) > 0 {
+		env := make(map[string]string, len(spec.Env)+len(a.env))
+		for key, value := range spec.Env {
+			env[key] = value
+		}
+		for key, value := range a.env {
+			env[key] = value
+		}
+		spec.Env = env
 	}
 	args := append(append([]string(nil), a.prefixArgs...), spec.Args...)
 	return spawnPTY(ctx, a.kind, a.executable, args, spec)
