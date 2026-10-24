@@ -1,0 +1,17 @@
+{
+  "name": "Mesh Axon",
+  "short_name": "Axon",
+  "description": "Secure remote control for Mesh-managed sessions",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09111f",
+  "theme_color": "#09111f",
+  "icons": [
+    {
+      "src": "/axon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
