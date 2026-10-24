@@ -45,6 +45,15 @@ raw diagnostic shell:
 ./bin/mesh-axon run zsh --name shell-debug
 ```
 
+After pairing, the web client lists every live session owned by the Axon Agent.
+Select a session to attach to its retained output and continue interacting with
+its process. The **New Mesh chat** form discovers installed Mesh workspaces and
+offers the runtimes supported by `mesh chat --target`.
+
+Axon cannot adopt an arbitrary process started in another terminal because it
+does not own that process's PTY. Start the process through Axon, or use the
+explicit `tmux-attach` target for an independently persistent terminal session.
+
 ## Security
 
 Axon is not approved for employer-managed machines unless the employer's

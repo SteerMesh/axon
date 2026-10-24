@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/authz"
+	"github.com/SteerMesh/axon/internal/meshcli"
 	"github.com/SteerMesh/axon/internal/session"
 	"github.com/SteerMesh/axon/internal/store"
 	"github.com/SteerMesh/axon/internal/target"
@@ -25,6 +26,12 @@ type Dispatcher struct {
 	manager   *session.Manager
 	store     *store.Store
 	templates *templates.Catalog
+	mesh      meshcli.Options
+}
+
+func (d *Dispatcher) WithMeshOptions(options meshcli.Options) *Dispatcher {
+	d.mesh = options
+	return d
 }
 
 func (d *Dispatcher) WithTemplates(catalog templates.Catalog) *Dispatcher {
@@ -52,6 +59,9 @@ func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request p
 	case string(authz.OperationList):
 		operationErr = authz.Authorize(device.Role, "", authz.OperationList, false)
 		result = d.manager.List()
+	case "mesh.options":
+		operationErr = authz.Authorize(device.Role, "", authz.OperationList, false)
+		result = d.mesh
 	case string(authz.OperationInput):
 		var params struct {
 			Bytes     []byte `json:"bytes"`
@@ -93,8 +103,10 @@ func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request p
 		result = map[string]bool{"signaled": operationErr == nil}
 	case string(authz.OperationCreate):
 		var params struct {
-			Template string `json:"template"`
-			Name     string `json:"name"`
+			Template  string `json:"template"`
+			Name      string `json:"name"`
+			Workspace string `json:"workspace"`
+			Target    string `json:"target"`
 		}
 		operationErr = json.Unmarshal(request.Data, &params)
 		if operationErr == nil {
@@ -108,7 +120,18 @@ func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request p
 			if err != nil {
 				operationErr = err
 			} else {
-				result, operationErr = d.manager.Create(context.Background(), params.Name, spec, permission)
+				if params.Workspace != "" || params.Target != "" {
+					if params.Template != "mesh" {
+						operationErr = errors.New("launch parameters are only supported by the Mesh template")
+					} else {
+						var args []string
+						args, operationErr = d.mesh.BuildArgs(params.Workspace, params.Target)
+						spec.Args = append(spec.Args, args...)
+					}
+				}
+				if operationErr == nil {
+					result, operationErr = d.manager.Create(context.Background(), params.Name, spec, permission)
+				}
 			}
 		}
 	case "session.replay":

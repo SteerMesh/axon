@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/SteerMesh/axon/internal/authz"
 	"github.com/SteerMesh/axon/internal/domain"
+	"github.com/SteerMesh/axon/internal/meshcli"
 	"github.com/SteerMesh/axon/internal/session"
 	"github.com/SteerMesh/axon/internal/templates"
 	"github.com/SteerMesh/axon/pkg/protocol"
@@ -104,6 +106,50 @@ func TestDispatcherTemplateAndConfirmationFailures(t *testing.T) {
 	_ = json.Unmarshal(response.Data, &got)
 	if got.Code != "confirmation_required" {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestDispatcherListsMeshOptionsAndCreatesConfiguredMeshSession(t *testing.T) {
+	r, _ := io.Pipe()
+	manager := session.NewManager(1024, endpointAdapter{process: &endpointProcess{r: r}})
+	catalog := templates.Catalog{Templates: map[string]templates.Template{
+		"mesh": {Target: "test", Permission: domain.PermissionInteractive},
+	}}
+	options := meshcli.Options{
+		Workspaces: []string{"steermesh-team"},
+		Targets:    []string{"kiro", "codex"},
+	}
+	dispatcher := NewDispatcher(manager, nil).WithTemplates(catalog).WithMeshOptions(options)
+	owner := DeviceContext{ID: "owner", Role: authz.RoleOwner}
+
+	response := dispatcher.Handle(context.Background(), owner, requestEnvelope("mesh.options", "", "options", nil))
+	if response.Type == "error" {
+		t.Fatalf("options failed: %s", response.Data)
+	}
+	var gotOptions meshcli.Options
+	if err := json.Unmarshal(response.Data, &gotOptions); err != nil || len(gotOptions.Workspaces) != 1 {
+		t.Fatalf("options = %+v, err = %v", gotOptions, err)
+	}
+
+	response = dispatcher.Handle(context.Background(), owner, requestEnvelope(string(authz.OperationCreate), "", "create", map[string]any{
+		"template": "mesh", "name": "remote", "workspace": "steermesh-team", "target": "codex",
+	}))
+	if response.Type == "error" {
+		t.Fatalf("create failed: %s", response.Data)
+	}
+	var created domain.Session
+	if err := json.Unmarshal(response.Data, &created); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := created.Target.Args, []string{"--ws", "steermesh-team", "--target", "codex"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %v, want %v", got, want)
+	}
+
+	response = dispatcher.Handle(context.Background(), owner, requestEnvelope(string(authz.OperationCreate), "", "invalid", map[string]any{
+		"template": "mesh", "name": "invalid", "workspace": "missing", "target": "codex",
+	}))
+	if response.Type != "error" {
+		t.Fatal("unknown workspace was accepted")
 	}
 }
 

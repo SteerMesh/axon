@@ -9,7 +9,7 @@
 html, body, #app { min-height: 100%; }
 html { scroll-padding-bottom: max(24px, env(safe-area-inset-bottom)); }
 body { margin: 0; min-height: 100vh; min-height: 100dvh; overflow-y: auto; background: radial-gradient(circle at 80% 0%, #15314a 0, #07101d 46%); }
-button, textarea, select { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button { color: inherit; }
 
 header {
@@ -37,9 +37,20 @@ h2 { font-size: 13px; color: #92a8c2; text-transform: uppercase; letter-spacing:
   min-height: 520px;
 }
 nav { padding: 22px 14px; border-right: 1px solid #24364b; }
-.session { width: 100%; margin-top: 16px; padding: 12px; display: flex; justify-content: space-between; border: 1px solid #2a4058; border-radius: 10px; background: #102033; text-align: left; }
+.session { width: 100%; margin-top: 10px; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid #2a4058; border-radius: 10px; background: #102033; text-align: left; cursor: pointer; }
+.session.active { border-color: #54e6b1; box-shadow: 0 0 0 1px rgb(84 230 177 / 22%); }
+.session span { min-width: 0; display: grid; gap: 3px; }
+.session b, .session small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session small { color: #6f86a0; font-size: 10px; }
 .session strong { color: #f2cb62; font-size: 12px; }
 .empty { color: #6f86a0; font-size: 12px; line-height: 1.5; }
+.session-launch { margin-top: 18px; border-top: 1px solid #24364b; padding-top: 14px; }
+.session-launch summary { cursor: pointer; color: #92a8c2; font-size: 12px; font-weight: 700; }
+#session-form { display: grid; gap: 8px; margin-top: 12px; }
+#session-form label { color: #92a8c2; font-size: 11px; }
+#session-form label span { color: #6f86a0; }
+#session-form input, #session-form select { width: 100%; min-width: 0; border: 1px solid #314860; border-radius: 8px; background: #07101d; color: inherit; padding: 9px; }
+#session-form button:disabled { cursor: wait; opacity: .55; }
 .terminal-panel {
   min-width: 0;
   min-height: 0;
@@ -65,7 +76,9 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
 
 @media (max-width: 720px) {
   .layout { display: block; height: auto; min-height: 0; }
-  nav { display: none; }
+  nav { padding: 14px 10px; border-right: 0; border-bottom: 1px solid #24364b; }
+  #session-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+  .session { margin-top: 8px; }
   .terminal-panel {
     display: flex;
     flex-direction: column;

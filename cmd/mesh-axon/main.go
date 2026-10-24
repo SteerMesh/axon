@@ -18,6 +18,7 @@ import (
 	"github.com/SteerMesh/axon/internal/detector"
 	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/ipc"
+	"github.com/SteerMesh/axon/internal/meshcli"
 	"github.com/SteerMesh/axon/internal/remote"
 	"github.com/SteerMesh/axon/internal/security"
 	serviceinstaller "github.com/SteerMesh/axon/internal/service"
@@ -112,6 +113,11 @@ func newServeCommand() *cobra.Command {
 					return fmt.Errorf("--relay-token or AXON_RELAY_TOKEN is required with --relay-url")
 				}
 				dispatcher := remote.NewDispatcher(manager, persistent)
+				meshOptions, optionsErr := meshcli.Discover(ctx, "mesh")
+				if optionsErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: %v\n", optionsErr)
+				}
+				dispatcher.WithMeshOptions(meshOptions)
 				catalog := templates.DefaultCatalog()
 				templatePath := filepath.Join(dataDir, "templates.yaml")
 				if _, statErr := os.Stat(templatePath); statErr == nil {

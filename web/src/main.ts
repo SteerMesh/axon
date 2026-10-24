@@ -5,6 +5,18 @@ import './style.css';
 import { pairAndConnect } from './pairing';
 import { AxonClient } from './client';
 
+interface SessionSummary {
+  id: string;
+  name: string;
+  state: string;
+  target: { kind: string; args?: string[] };
+}
+
+interface MeshOptions {
+  workspaces: string[];
+  targets: string[];
+}
+
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
 }
@@ -20,14 +32,27 @@ app.innerHTML = `
   <section class="layout">
     <nav aria-label="Sessions">
       <h2>Sessions</h2>
-      <button class="session active" type="button"><span>local</span><strong>Waiting</strong></button>
-      <p class="empty">Pair this client to load live sessions.</p>
+      <div id="session-list"></div>
+      <p id="session-empty" class="empty">Pair this client to load managed Mesh sessions.</p>
+      <details class="session-launch">
+        <summary>New Mesh chat</summary>
+        <form id="session-form">
+          <label for="session-name">Name <span>(optional)</span></label>
+          <input id="session-name" autocomplete="off" placeholder="Generated automatically" />
+          <label for="mesh-workspace">Workspace</label>
+          <select id="mesh-workspace"><option value="">Current / default</option></select>
+          <label for="mesh-target">Target</label>
+          <select id="mesh-target"><option value="">Mesh default</option></select>
+          <button class="primary" type="submit" disabled>Start Mesh chat</button>
+        </form>
+      </details>
     </nav>
     <article class="terminal-panel">
       <div id="terminal" aria-label="Terminal output"></div>
       <div class="shortcuts" aria-label="Terminal shortcuts">
         <button type="button" data-action="terminal-bottom">Terminal ↓</button>
         <button type="button" data-action="controls">Controls ↓</button>
+        <button type="button" data-sequence="\r">Enter</button>
         <button type="button" data-sequence="\u001b">Esc</button>
         <button type="button" data-sequence="\t">Tab</button>
         <button type="button" data-sequence="\u0003">Ctrl-C</button>
@@ -76,7 +101,7 @@ terminal.writeln('Pair a device to begin.');
 let secureConnection: Awaited<ReturnType<typeof pairAndConnect>> | undefined;
 let axonClient: AxonClient | undefined;
 let activeSessionId = '';
-let nextSequence = 0;
+let sessions: SessionSummary[] = [];
 
 let fitFrame = 0;
 const scheduleFit = (): void => {
@@ -114,30 +139,59 @@ document.querySelector<HTMLFormElement>('#composer')!.addEventListener('submit',
   prompt.value = '';
 });
 
+document.querySelector<HTMLFormElement>('#session-form')!.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!axonClient) return;
+  const button = document.querySelector<HTMLButtonElement>('#session-form button')!;
+  button.disabled = true;
+  try {
+    const response = await axonClient.request<SessionSummary>('session.create', {
+      template: 'mesh',
+      name: document.querySelector<HTMLInputElement>('#session-name')!.value.trim(),
+      workspace: document.querySelector<HTMLSelectElement>('#mesh-workspace')!.value,
+      target: document.querySelector<HTMLSelectElement>('#mesh-target')!.value,
+    });
+    if (response.data) {
+      sessions = [...sessions, response.data];
+      renderSessions();
+      selectSession(response.data);
+      document.querySelector<HTMLDetailsElement>('.session-launch')!.open = false;
+    }
+  } catch (error) {
+    terminal.writeln(`\r\n\x1b[31m${error instanceof Error ? error.message : String(error)}\x1b[0m`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('submit', async (event) => {
 	event.preventDefault();
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
 	state.textContent = 'Pairing…';
 	try {
-		secureConnection = await pairAndConnect(
+		const paired = await pairAndConnect(
 			document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value.trim(),
 			document.querySelector<HTMLInputElement>('#relay-ticket')!.value,
 		);
+		axonClient?.close();
+		secureConnection = paired;
+		activeSessionId = '';
 		axonClient = new AxonClient(secureConnection.transport);
 		state.textContent = 'Encrypted';
 		terminal.writeln(`\r\nPaired with ${secureConnection.mateId}.`);
-		const response = await axonClient.request<Array<{ id: string; name: string; state: string }>>('sessions.list');
-		let sessions = response.data ?? [];
+		await loadMeshOptions();
+		const response = await axonClient.request<SessionSummary[]>('sessions.list');
+		sessions = response.data ?? [];
 		if (sessions.length === 0) {
-			const created = await axonClient.request<{ id: string; name: string; state: string }>(
+			const created = await axonClient.request<SessionSummary>(
 				'session.create',
 				{ template: 'mesh', name: 'mesh' },
 			);
 			if (created.data) sessions = [created.data];
 		}
-		activeSessionId = sessions[0]?.id ?? '';
-		terminal.writeln(`Sessions: ${sessions.map((session) => `${session.name} (${session.state})`).join(', ') || 'none'}`);
-		if (activeSessionId) void replayLoop(activeSessionId);
+		renderSessions();
+		if (sessions[0]) selectSession(sessions[0]);
+		document.querySelector<HTMLButtonElement>('#session-form button')!.disabled = false;
 		document.querySelector<HTMLDetailsElement>('.pairing')!.open = false;
 	} catch (error) {
 		state.textContent = 'Pairing failed';
@@ -159,7 +213,55 @@ function sendInput(text: string, confirmed: boolean): void {
 	}, activeSessionId).catch((error) => terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`));
 }
 
+async function loadMeshOptions(): Promise<void> {
+  if (!axonClient) return;
+  const response = await axonClient.request<MeshOptions>('mesh.options');
+  const options = response.data;
+  if (!options) return;
+  replaceOptions('#mesh-workspace', 'Current / default', options.workspaces);
+  replaceOptions('#mesh-target', 'Mesh default', options.targets);
+}
+
+function replaceOptions(selector: string, emptyLabel: string, values: string[]): void {
+  const select = document.querySelector<HTMLSelectElement>(selector)!;
+  select.replaceChildren(new Option(emptyLabel, ''), ...values.map((value) => new Option(value, value)));
+}
+
+function renderSessions(): void {
+  const list = document.querySelector<HTMLElement>('#session-list')!;
+  list.replaceChildren(...sessions.map((session) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `session${session.id === activeSessionId ? ' active' : ''}`;
+    const identity = document.createElement('span');
+    const name = document.createElement('b');
+    name.textContent = session.name;
+    const target = document.createElement('small');
+    target.textContent = [session.target.kind, ...(session.target.args ?? [])].join(' ');
+    identity.append(name, target);
+    const state = document.createElement('strong');
+    state.textContent = session.state;
+    button.append(identity, state);
+    button.addEventListener('click', () => selectSession(session));
+    return button;
+  }));
+  const empty = document.querySelector<HTMLElement>('#session-empty')!;
+  empty.hidden = sessions.length > 0;
+  if (sessions.length === 0) empty.textContent = axonClient ? 'No managed sessions.' : 'Pair this client to load managed Mesh sessions.';
+}
+
+function selectSession(session: SessionSummary): void {
+  if (activeSessionId === session.id) return;
+  activeSessionId = session.id;
+  renderSessions();
+  terminal.reset();
+  terminal.writeln(`\x1b[38;2;84;230;177m${session.name}\x1b[0m · ${session.target.kind}`);
+  scheduleFit();
+  void replayLoop(session.id);
+}
+
 async function replayLoop(sessionId: string): Promise<void> {
+	let nextSequence = 0;
 	while (axonClient && activeSessionId === sessionId) {
 		try {
 			const response = await axonClient.request<{
@@ -168,6 +270,7 @@ async function replayLoop(sessionId: string): Promise<void> {
 				max_seq: number;
 				gap: boolean;
 			}>('session.replay', { from_seq: nextSequence }, sessionId);
+			if (activeSessionId !== sessionId) return;
 			const replay = response.data;
 			if (replay?.gap) {
 				terminal.writeln(`\r\n\x1b[33mOutput before sequence ${replay.min_seq} is no longer retained.\x1b[0m`);
