@@ -65,6 +65,7 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
 .banner.error { background: rgb(255 92 92 / 12%); color: #ff8a8a; border: 1px solid rgb(255 92 92 / 35%); }
 .banner.info { background: rgb(84 230 177 / 10%); color: #8be8c8; border: 1px solid rgb(84 230 177 / 30%); }
 .landing { display: grid; gap: 16px; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr); align-items: start; }
+.landing[hidden] { display: none; }
 .landing-launch, .landing-sessions { border: 1px solid #24364b; border-radius: 12px; background: #0d1b2c; padding: 16px; }
 .landing-launch h2, .landing-sessions h2 { margin-bottom: 4px; }
 .session-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 12px; }
@@ -81,6 +82,7 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
 .state-badge.state-finished { color: #6f86a0; background: rgb(111 134 160 / 14%); }
 .state-badge.state-error { color: #ff8a8a; background: rgb(255 92 92 / 14%); }
 #session-view { display: flex; flex-direction: column; gap: 12px; min-height: 0; flex: 1 1 auto; }
+#session-view[hidden] { display: none; }
 #terminal { flex: 1 1 auto; min-height: 300px; padding: 12px; border: 1px solid #24364b; border-radius: 12px; overflow: hidden; background: #07101d; box-shadow: 0 20px 80px rgb(0 0 0 / 28%); }
 .shortcuts { display: flex; gap: 8px; overflow-x: auto; }
 .shortcuts button, select { border: 1px solid #314860; border-radius: 8px; background: #102033; padding: 9px 12px; white-space: nowrap; }
