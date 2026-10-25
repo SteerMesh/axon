@@ -22,6 +22,22 @@ const (
 	packetHandshakeReply byte = 2
 	packetTransport      byte = 3
 	packetPairingReply   byte = 4
+	// packetError carries a plaintext, unencrypted {"code","message"} failure
+	// detail from Mate to device. It is sent whenever Endpoint.Handle fails so
+	// a waiting device never hangs on a request the Mate silently dropped.
+	packetError byte = 5
+)
+
+// Sentinel errors classify Handle failures so Connector can tell a device
+// exactly what went wrong instead of silently dropping its request. Message
+// text is preserved from the original call sites so existing substring
+// assertions keep working; only the identity is new.
+var (
+	ErrHandshakeRequired = errors.New("device must complete Noise handshake")
+	ErrChannelReset      = errors.New("decrypt device packet")
+	ErrDeviceRevoked     = errors.New("device is revoked")
+	ErrDeviceInactive    = errors.New("device is not active")
+	ErrPairingRejected   = errors.New("pairing request was rejected")
 )
 
 type Endpoint struct {
@@ -83,7 +99,10 @@ func (e *Endpoint) Handle(ctx context.Context, deviceID string, packet []byte) (
 	}
 	if packet[0] == packetPairingInit {
 		reply, err := e.completePairing(ctx, packet[1:])
-		return Outbound{Packet: reply}, err
+		if err != nil {
+			return Outbound{}, fmt.Errorf("%w: %w", ErrPairingRejected, err)
+		}
+		return Outbound{Packet: reply}, nil
 	}
 	e.mu.Lock()
 	channel, established := e.channels[deviceID]
@@ -91,14 +110,14 @@ func (e *Endpoint) Handle(ctx context.Context, deviceID string, packet []byte) (
 
 	if !established {
 		if packet[0] != packetHandshakeInit {
-			return Outbound{}, errors.New("device must complete Noise handshake")
+			return Outbound{}, ErrHandshakeRequired
 		}
 		device, err := e.store.Device(ctx, deviceID)
 		if err != nil {
 			return Outbound{}, fmt.Errorf("load paired device: %w", err)
 		}
 		if device.RevokedAt != nil {
-			return Outbound{}, errors.New("device is revoked")
+			return Outbound{}, ErrDeviceRevoked
 		}
 		prologue := []byte("mesh-axon-v1:" + e.mateID + ":" + deviceID)
 		responder, err := security.NewIKResponder(e.identity.Noise, prologue)
@@ -124,7 +143,7 @@ func (e *Endpoint) Handle(ctx context.Context, deviceID string, packet []byte) (
 	plaintext, err := channel.Recv.Decrypt(nil, nil, packet[1:])
 	if err != nil {
 		e.drop(deviceID)
-		return Outbound{}, fmt.Errorf("decrypt device packet: %w", err)
+		return Outbound{}, fmt.Errorf("%w: %w", ErrChannelReset, err)
 	}
 	var request protocol.Envelope
 	if err := json.Unmarshal(plaintext, &request); err != nil {
@@ -133,7 +152,7 @@ func (e *Endpoint) Handle(ctx context.Context, deviceID string, packet []byte) (
 	device, err := e.store.Device(ctx, deviceID)
 	if err != nil || device.RevokedAt != nil {
 		e.drop(deviceID)
-		return Outbound{}, errors.New("device is not active")
+		return Outbound{}, ErrDeviceInactive
 	}
 	deviceContext := DeviceContext{ID: deviceID, Role: device.Role}
 	if request.Type == "session.subscribe" {
@@ -270,6 +289,37 @@ func (e *Endpoint) completePairing(ctx context.Context, payload []byte) ([]byte,
 		return nil, err
 	}
 	return append([]byte{packetPairingReply}, encoded...), nil
+}
+
+// errorDetail is the plaintext payload carried by a packetError frame. It is
+// deliberately generic for unclassified failures so internal details (store
+// paths, driver errors, …) are never relayed to a device; the full error is
+// still available server-side via the caller's log line.
+type errorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// errorPacket translates a Handle failure into a wire frame a device can act
+// on, so a request the Mate could not satisfy always gets a reply instead of
+// leaving the device's pending promise hanging forever.
+func errorPacket(err error) []byte {
+	detail := errorDetail{Code: "request_rejected", Message: "the mate rejected this request"}
+	switch {
+	case errors.Is(err, ErrHandshakeRequired), errors.Is(err, ErrChannelReset):
+		detail = errorDetail{Code: "channel_reset_required", Message: "secure channel is no longer valid; pair again"}
+	case errors.Is(err, ErrDeviceRevoked):
+		detail = errorDetail{Code: "device_revoked", Message: "this device has been revoked"}
+	case errors.Is(err, ErrDeviceInactive):
+		detail = errorDetail{Code: "device_inactive", Message: "this device is no longer active"}
+	case errors.Is(err, ErrPairingRejected):
+		detail = errorDetail{Code: "pairing_rejected", Message: "pairing was rejected"}
+	}
+	encoded, marshalErr := json.Marshal(detail)
+	if marshalErr != nil {
+		encoded = []byte(`{"code":"request_rejected","message":"the mate rejected this request"}`)
+	}
+	return append([]byte{packetError}, encoded...)
 }
 
 func (e *Endpoint) Revoke(deviceID string) { e.drop(deviceID) }

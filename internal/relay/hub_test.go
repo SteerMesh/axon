@@ -126,6 +126,52 @@ func TestHubForwardsMateToDevice(t *testing.T) {
 	}
 }
 
+func TestHubKeepsMateConnectedWhenDeviceDeliveryFails(t *testing.T) {
+	hub := NewHub("test-token")
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	mate := dialPeer(t, ctx, server.URL, "mate-1", "mate", "")
+	defer mate.CloseNow()
+	closedConn := dialPeer(t, ctx, server.URL, "throwaway", "device", "throwaway")
+	closedConn.CloseNow()
+	stale := &peer{conn: closedConn, mateID: "mate-1", deviceID: "stale", role: "device"}
+	if err := hub.register(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	failedDelivery, _ := json.Marshal(RouteFrame{
+		Version: 1, MateID: "mate-1", To: "stale", Payload: []byte("undeliverable"),
+	})
+	if err := mate.Write(ctx, websocket.MessageBinary, failedDelivery); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for hub.target(RouteFrame{MateID: "mate-1", To: "stale"}) != nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if hub.target(RouteFrame{MateID: "mate-1", To: "stale"}) != nil {
+		t.Fatal("failed device remained registered")
+	}
+
+	live := dialPeer(t, ctx, server.URL, "mate-1", "device", "live")
+	defer live.CloseNow()
+	fromDevice, _ := json.Marshal(RouteFrame{Version: 1, MateID: "mate-1", Payload: []byte("still-connected")})
+	if err := live.Write(ctx, websocket.MessageBinary, fromDevice); err != nil {
+		t.Fatal(err)
+	}
+	_, received, err := mate.Read(ctx)
+	if err != nil {
+		t.Fatalf("mate was disconnected after stale device delivery: %v", err)
+	}
+	var frame RouteFrame
+	if err := json.Unmarshal(received, &frame); err != nil || string(frame.Payload) != "still-connected" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+}
+
 func TestHubRegistrationAndInvalidFrames(t *testing.T) {
 	hub := NewHub("token")
 	mate := &peer{mateID: "mate", role: "mate"}

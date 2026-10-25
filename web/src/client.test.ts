@@ -59,4 +59,43 @@ describe('AxonClient', () => {
     expect(handler).not.toHaveBeenCalled();
     client.close();
   });
+
+  it('rejects a request that never gets a reply instead of hanging forever', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakeTransport();
+      const client = new AxonClient(transport);
+      const response = client.request('session.create', undefined, undefined, 1000);
+      const assertion = expect(response).rejects.toThrow('session.create request timed out');
+      await vi.advanceTimersByTimeAsync(1000);
+      await assertion;
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forgets a timed-out request so a late reply cannot resolve it twice', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakeTransport();
+      const client = new AxonClient(transport);
+      const response = client.request('sessions.list', undefined, undefined, 1000);
+      const request = transport.sent[0] as { id: string };
+      const assertion = expect(response).rejects.toThrow('timed out');
+      await vi.advanceTimersByTimeAsync(1000);
+      await assertion;
+
+      // A reply that arrives after the timeout must be a harmless no-op, not
+      // a crash or a resolution of a promise the caller already gave up on.
+      transport.push({
+        v: 1, id: 'late-reply', reply_to: request.id, type: 'sessions.list.response',
+        ts: new Date().toISOString(), data: [],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

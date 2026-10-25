@@ -29,10 +29,27 @@ func NewConnector(relayURL, token, mateID string, endpoint *Endpoint) *Connector
 	return &Connector{relayURL: relayURL, token: token, mateID: mateID, endpoint: endpoint}
 }
 
+// healthyConnectionWindow is how long a relay connection must stay up before
+// a subsequent failure is treated as a fresh problem rather than a
+// continuation of a prior outage, so backoff can reset to its floor instead
+// of staying stretched out from an earlier, unrelated run of failures.
+const healthyConnectionWindow = 10 * time.Second
+
+// resetsBackoff reports whether a connection that stayed up for connectedFor
+// counts as healthy enough to reset backoff to its floor on disconnect.
+func resetsBackoff(connectedFor time.Duration) bool {
+	return connectedFor >= healthyConnectionWindow
+}
+
 func (c *Connector) Run(ctx context.Context) error {
 	backoff := time.Second
 	for {
-		if err := c.runOnce(ctx); err != nil && ctx.Err() == nil {
+		connectedAt := time.Now()
+		err := c.runOnce(ctx)
+		if resetsBackoff(time.Since(connectedAt)) {
+			backoff = time.Second
+		}
+		if err != nil && ctx.Err() == nil {
 			slog.Warn("Axon relay connection ended", "error", err, "retry_in", backoff)
 		}
 		if ctx.Err() != nil {
@@ -101,6 +118,12 @@ func (c *Connector) runOnce(ctx context.Context) error {
 		outbound, err := c.endpoint.Handle(ctx, frame.From, frame.Payload)
 		if err != nil {
 			slog.Warn("Rejected remote frame", "device_id", frame.From, "error", err)
+			// A device waiting on this request must never hang indefinitely:
+			// always send back a reply, even when the Mate could not satisfy
+			// it, so the device's pending promise settles.
+			if sendErr := c.Send(ctx, frame.From, errorPacket(err)); sendErr != nil {
+				return sendErr
+			}
 			continue
 		}
 		if outbound.Envelope != nil {

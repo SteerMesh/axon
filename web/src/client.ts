@@ -1,4 +1,8 @@
 import type { SecureTransport } from './relay';
+import { withTimeout } from './timeout';
+
+/** How long a single request may wait for a reply before it is abandoned. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 interface Envelope<T = unknown> {
   v: 1;
@@ -31,7 +35,7 @@ export class AxonClient {
     void this.#readLoop();
   }
 
-  request<T>(type: string, data?: unknown, sessionId?: string): Promise<Envelope<T>> {
+  request<T>(type: string, data?: unknown, sessionId?: string, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Envelope<T>> {
     if (this.#closed) return Promise.reject(new Error('Axon connection is closed'));
     const id = crypto.randomUUID();
     const envelope: Envelope = {
@@ -44,10 +48,17 @@ export class AxonClient {
       ...(data === undefined ? {} : { data }),
     };
     this.#transport.send(envelope);
-    return new Promise<Envelope<T>>((resolve, reject) => this.#pending.set(id, {
+    const settled = new Promise<Envelope<T>>((resolve, reject) => this.#pending.set(id, {
       resolve: resolve as (value: Envelope) => void,
       reject,
     }));
+    // A request that never gets a reply (relay/mate silently drops it, or
+    // the device simply never hears back) must still resolve the promise
+    // the UI is awaiting, so it cannot hang indefinitely.
+    return withTimeout(settled, timeoutMs, `${type} request timed out`).catch((error: unknown) => {
+      this.#pending.delete(id);
+      throw error;
+    });
   }
 
   on<T>(type: string, handler: (envelope: Envelope<T>) => void): () => void {

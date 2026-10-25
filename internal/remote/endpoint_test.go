@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -325,6 +326,44 @@ func TestEndpointSubscriptionCleanupPaths(t *testing.T) {
 	case <-emitCanceled:
 	case <-time.After(time.Second):
 		t.Fatal("subscription was not canceled after an emit failure")
+	}
+}
+
+func TestErrorPacketClassifiesKnownFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"handshake required", ErrHandshakeRequired, "channel_reset_required"},
+		{"channel reset wraps the decrypt failure", fmt.Errorf("%w: %w", ErrChannelReset, errors.New("mac mismatch")), "channel_reset_required"},
+		{"device revoked", ErrDeviceRevoked, "device_revoked"},
+		{"device inactive", ErrDeviceInactive, "device_inactive"},
+		{"pairing rejected wraps the underlying reason", fmt.Errorf("%w: %w", ErrPairingRejected, errors.New("token expired")), "pairing_rejected"},
+		{"unclassified error falls back to a generic code", errors.New("load paired device: disk is full"), "request_rejected"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			packet := errorPacket(tc.err)
+			if packet[0] != packetError {
+				t.Fatalf("expected packetError kind, got %d", packet[0])
+			}
+			var detail errorDetail
+			if err := json.Unmarshal(packet[1:], &detail); err != nil {
+				t.Fatalf("error payload was not valid JSON: %v", err)
+			}
+			if detail.Code != tc.code {
+				t.Fatalf("code = %q, want %q", detail.Code, tc.code)
+			}
+			if detail.Message == "" {
+				t.Fatal("message was empty")
+			}
+			// The unclassified fallback must never leak the wrapped error's
+			// text (which may carry internal detail such as store paths).
+			if tc.code == "request_rejected" && strings.Contains(detail.Message, "disk is full") {
+				t.Fatalf("fallback message leaked internal detail: %q", detail.Message)
+			}
+		})
 	}
 }
 

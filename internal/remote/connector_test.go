@@ -162,6 +162,83 @@ func TestConnectorValidationAndCancellation(t *testing.T) {
 	}
 }
 
+// TestConnectorRepliesWithErrorPacketOnRejectedFrame covers the hang that
+// motivated this change: a device sends a transport packet before (or after
+// losing) an established Noise channel, Handle rejects it, and the device
+// must receive an explicit packetError reply instead of waiting forever for
+// a response the Mate silently dropped.
+func TestConnectorRepliesWithErrorPacketOnRejectedFrame(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := relay.NewHub("relay-token")
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	persistent, err := store.Open(filepath.Join(t.TempDir(), "axon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistent.Close()
+	mate, _ := security.GenerateIdentity()
+	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(session.NewManager(1024), persistent))
+	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
+	go func() { _ = connector.Run(ctx) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for !hub.MateConnected("mate-1") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !hub.MateConnected("mate-1") {
+		t.Fatal("Mate did not connect to relay")
+	}
+
+	deviceURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/connect?mate_id=mate-1&role=device&device_id=device-1"
+	header := make(http.Header)
+	header.Set("Authorization", "Bearer relay-token")
+	conn, _, err := websocket.Dial(ctx, deviceURL, &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	// A transport packet with no prior handshake cannot be satisfied; the
+	// device must still get a reply rather than hang.
+	reply := exchangeRoute(t, ctx, conn, []byte{packetTransport, 1, 2, 3})
+	if reply[0] != packetError {
+		t.Fatalf("expected packetError reply, got kind %d", reply[0])
+	}
+	var detail errorDetail
+	if err := json.Unmarshal(reply[1:], &detail); err != nil {
+		t.Fatalf("error payload was not valid JSON: %v", err)
+	}
+	if detail.Code != "channel_reset_required" {
+		t.Fatalf("unexpected error code: %+v", detail)
+	}
+
+	// The Mate connection itself must have survived the rejection.
+	if !hub.MateConnected("mate-1") {
+		t.Fatal("Mate disconnected after replying with an error packet")
+	}
+}
+
+func TestConnectorBackoffResetsAfterHealthyConnection(t *testing.T) {
+	cases := []struct {
+		name         string
+		connectedFor time.Duration
+		wantReset    bool
+	}{
+		{"well under the window", 9 * time.Second, false},
+		{"just under the window", healthyConnectionWindow - time.Millisecond, false},
+		{"exactly at the window", healthyConnectionWindow, true},
+		{"well past the window", 30 * time.Second, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resetsBackoff(tc.connectedFor); got != tc.wantReset {
+				t.Fatalf("resetsBackoff(%s) = %v, want %v", tc.connectedFor, got, tc.wantReset)
+			}
+		})
+	}
+}
+
 func exchangeRoute(t *testing.T, ctx context.Context, conn *websocket.Conn, payload []byte) []byte {
 	t.Helper()
 	frame, _ := json.Marshal(relay.RouteFrame{Version: 1, MateID: "mate-1", Payload: payload})

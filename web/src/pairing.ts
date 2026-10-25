@@ -1,6 +1,10 @@
 import { NoiseIKInitiator } from './crypto/noiseIK';
 import { loadOrCreateIdentity } from './identityStore';
-import { base64, base64URL, fromBase64, RelayTransport, SecureTransport } from './relay';
+import { base64, base64URL, fromBase64, mateRejection, RelayTransport, SecureTransport } from './relay';
+import { withTimeout } from './timeout';
+
+/** How long pairing and the Noise handshake may each wait for a relay reply. */
+const PAIRING_STEP_TIMEOUT_MS = 15_000;
 
 interface PairingBundle {
   mate_id: string;
@@ -50,23 +54,34 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
 
   const relay = new RelayTransport(bundle.relay_url, bundle.mate_id, deviceId, relayTicket);
   await relay.opened();
-  const pairingRequest = new TextEncoder().encode(JSON.stringify({
-    token: bundle.one_time_token,
-    presentation: { ...presentationWithoutSignature, signature: base64(signature) },
-  }));
-  relay.send(packet(0, pairingRequest));
-  const pairingReply = await relay.receive();
-  if (pairingReply[0] !== 4) throw new Error('Mate rejected pairing');
-  const record = JSON.parse(new TextDecoder().decode(pairingReply.slice(1))) as DeviceRecord;
-  await verifyRecord(record, bundle);
+  try {
+    const pairingRequest = new TextEncoder().encode(JSON.stringify({
+      token: bundle.one_time_token,
+      presentation: { ...presentationWithoutSignature, signature: base64(signature) },
+    }));
+    relay.send(packet(0, pairingRequest));
+    const pairingReply = await withTimeout(relay.receive(), PAIRING_STEP_TIMEOUT_MS, 'pairing timed out waiting for the mate');
+    if (pairingReply[0] === 5) throw mateRejection(pairingReply.slice(1));
+    if (pairingReply[0] !== 4) throw new Error('Mate rejected pairing');
+    const record = JSON.parse(new TextDecoder().decode(pairingReply.slice(1))) as DeviceRecord;
+    await verifyRecord(record, bundle);
 
-  const prologue = new TextEncoder().encode(`mesh-axon-v1:${bundle.mate_id}:${deviceId}`);
-  const initiator = new NoiseIKInitiator(identity.noiseKeyPair, fromBase64(bundle.mate_noise_key), prologue);
-  relay.send(packet(1, await initiator.start(new TextEncoder().encode(deviceId))));
-  const handshakeReply = await relay.receive();
-  if (handshakeReply[0] !== 2) throw new Error('Mate rejected the encrypted channel');
-  const { channel } = await initiator.finish(handshakeReply.slice(1));
-  return { deviceId, mateId: bundle.mate_id, transport: new SecureTransport(relay, channel) };
+    const prologue = new TextEncoder().encode(`mesh-axon-v1:${bundle.mate_id}:${deviceId}`);
+    const initiator = new NoiseIKInitiator(identity.noiseKeyPair, fromBase64(bundle.mate_noise_key), prologue);
+    relay.send(packet(1, await initiator.start(new TextEncoder().encode(deviceId))));
+    const handshakeReply = await withTimeout(relay.receive(), PAIRING_STEP_TIMEOUT_MS, 'handshake timed out waiting for the mate');
+    if (handshakeReply[0] === 5) throw mateRejection(handshakeReply.slice(1));
+    if (handshakeReply[0] !== 2) throw new Error('Mate rejected the encrypted channel');
+    const { channel } = await initiator.finish(handshakeReply.slice(1));
+    return { deviceId, mateId: bundle.mate_id, transport: new SecureTransport(relay, channel) };
+  } catch (error) {
+    // A failed or timed-out pairing attempt must not leave a stale device
+    // socket registered on the relay — that blocks every retry until the
+    // old tab is closed (see the Axon handoff notes on this exact pain
+    // point).
+    relay.close();
+    throw error;
+  }
 }
 
 function decodeBundle(encoded: string): PairingBundle {

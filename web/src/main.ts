@@ -17,6 +17,10 @@ interface MeshOptions {
   targets: string[];
 }
 
+// session.create may spawn a process (e.g. launching `mesh chat`), so give
+// it more room than the client's default request timeout before giving up.
+const SESSION_CREATE_TIMEOUT_MS = 30_000;
+
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
 }
@@ -152,7 +156,7 @@ document.querySelector<HTMLFormElement>('#session-form')!.addEventListener('subm
       name: document.querySelector<HTMLInputElement>('#session-name')!.value.trim(),
       workspace: document.querySelector<HTMLSelectElement>('#mesh-workspace')!.value,
       target: document.querySelector<HTMLSelectElement>('#mesh-target')!.value,
-    });
+    }, undefined, SESSION_CREATE_TIMEOUT_MS);
     if (response.data) {
       sessions = [...sessions, response.data];
       renderSessions();
@@ -206,6 +210,8 @@ document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('subm
 			const created = await axonClient.request<SessionSummary>(
 				'session.create',
 				{ template: 'mesh', name: 'mesh' },
+				undefined,
+				SESSION_CREATE_TIMEOUT_MS,
 			);
 			if (created.data) sessions = [created.data];
 		}

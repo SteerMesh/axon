@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -66,10 +67,12 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins, Subprotocols: []string{"axon.v1"}})
 	if err != nil {
+		slog.Warn("Relay WebSocket acceptance failed", "mate_id", mateID, "role", role, "error", err)
 		return
 	}
 	p := &peer{conn: conn, mateID: mateID, role: role, deviceID: deviceID}
 	if err := h.register(p); err != nil {
+		slog.Warn("Relay peer registration rejected", "mate_id", mateID, "role", role, "device_id", deviceID, "error", err)
 		_ = conn.Close(websocket.StatusPolicyViolation, err.Error())
 		return
 	}
@@ -135,14 +138,36 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 	for {
 		messageType, data, err := source.conn.Read(ctx)
 		if err != nil {
+			slog.Info("Relay peer disconnected",
+				"mate_id", source.mateID,
+				"role", source.role,
+				"device_id", source.deviceID,
+				"status", websocket.CloseStatus(err),
+				"error", err,
+			)
 			return
 		}
 		if messageType != websocket.MessageBinary || len(data) > MaxFrameBytes {
+			slog.Warn("Relay rejected message",
+				"mate_id", source.mateID,
+				"role", source.role,
+				"device_id", source.deviceID,
+				"message_type", messageType,
+				"size", len(data),
+			)
 			_ = source.conn.Close(websocket.StatusUnsupportedData, "binary frame required or frame too large")
 			return
 		}
 		var frame RouteFrame
 		if err := json.Unmarshal(data, &frame); err != nil || frame.Version != 1 || frame.MateID != source.mateID {
+			slog.Warn("Relay rejected route frame",
+				"mate_id", source.mateID,
+				"role", source.role,
+				"device_id", source.deviceID,
+				"frame_version", frame.Version,
+				"frame_mate_id", frame.MateID,
+				"error", err,
+			)
 			_ = source.conn.Close(websocket.StatusPolicyViolation, "invalid routing frame")
 			return
 		}
@@ -152,12 +177,17 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 		} else {
 			frame.From = "mate"
 			if frame.To == "" || frame.To == "mate" {
+				slog.Warn("Relay rejected mate route without device destination", "mate_id", source.mateID, "to", frame.To)
 				_ = source.conn.Close(websocket.StatusPolicyViolation, "mate frame requires device destination")
 				return
 			}
 		}
 		target := h.target(frame)
 		if target == nil {
+			if source.role == "device" {
+				_ = source.conn.Close(websocket.StatusTryAgainLater, "mate unavailable")
+				return
+			}
 			continue
 		}
 		forwarded, _ := json.Marshal(frame)
@@ -165,7 +195,18 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 		err = target.write(writeCtx, forwarded)
 		cancel()
 		if err != nil {
-			return
+			slog.Warn("Relay target delivery failed",
+				"source_role", source.role,
+				"mate_id", source.mateID,
+				"device_id", target.deviceID,
+				"error", err,
+			)
+			h.unregister(target)
+			target.conn.CloseNow()
+			if source.role == "device" {
+				_ = source.conn.Close(websocket.StatusTryAgainLater, "mate unavailable")
+				return
+			}
 		}
 	}
 }
