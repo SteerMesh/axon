@@ -70,6 +70,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("Relay WebSocket acceptance failed", "mate_id", mateID, "role", role, "error", err)
 		return
 	}
+	// coder/websocket defaults to a 32768-byte read limit, well under
+	// MaxFrameBytes. Without raising it here, any frame between 32KB and
+	// MaxFrameBytes never reaches the size check in readLoop below — the
+	// library kills the connection first with StatusMessageTooBig.
+	conn.SetReadLimit(MaxFrameBytes)
 	p := &peer{conn: conn, mateID: mateID, role: role, deviceID: deviceID}
 	if err := h.register(p); err != nil {
 		slog.Warn("Relay peer registration rejected", "mate_id", mateID, "role", role, "device_id", deviceID, "error", err)

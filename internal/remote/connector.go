@@ -93,6 +93,10 @@ func (c *Connector) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Match the relay's accepted-connection read limit (see hub.go) so a
+	// large frame the relay forwards to this Mate isn't killed by
+	// coder/websocket's much smaller 32768-byte default first.
+	conn.SetReadLimit(relay.MaxFrameBytes)
 	c.writeMu.Lock()
 	c.conn = conn
 	c.writeMu.Unlock()
