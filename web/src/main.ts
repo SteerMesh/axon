@@ -105,6 +105,8 @@ app.innerHTML = `
       <div id="session-view" hidden>
         <div class="shortcuts" aria-label="Session controls">
           <button type="button" data-action="back-to-sessions">← Sessions</button>
+          <button type="button" data-action="toggle-focus" aria-pressed="false">⛶ Focus</button>
+          <button type="button" data-action="close-session" class="danger">✕ Close session</button>
         </div>
         <div id="terminal" aria-label="Terminal output"></div>
         <div class="shortcuts" aria-label="Terminal shortcuts">
@@ -153,6 +155,7 @@ let activeSessionId = '';
 let activeEpoch = '';
 let nextSequence = 0;
 let sessions: SessionSummary[] = [];
+let focusMode = false;
 
 let fitFrame = 0;
 const scheduleFit = (): void => {
@@ -227,6 +230,22 @@ document.querySelector<HTMLButtonElement>('#nav-new-session')!.addEventListener(
 
 document.querySelector<HTMLButtonElement>('[data-action="back-to-sessions"]')!.addEventListener('click', () => {
   showLanding();
+});
+
+document.querySelector<HTMLButtonElement>('[data-action="toggle-focus"]')!.addEventListener('click', () => {
+  setFocusMode(!focusMode);
+});
+
+document.querySelector<HTMLButtonElement>('[data-action="close-session"]')!.addEventListener('click', async () => {
+  if (!axonClient || !activeSessionId) return;
+  const session = sessions.find((candidate) => candidate.id === activeSessionId);
+  if (!window.confirm(`End "${session?.name ?? activeSessionId}"? This stops the underlying process.`)) return;
+  try {
+    await axonClient.request('session.signal', { signal: 'TERM' }, activeSessionId);
+    showLanding();
+  } catch (error) {
+    showBanner(error instanceof Error ? error.message : String(error), 'error');
+  }
 });
 
 document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('submit', async (event) => {
@@ -375,10 +394,23 @@ function hideBanner(): void {
 
 function showLanding(): void {
   activeSessionId = '';
+  setFocusMode(false);
   document.querySelector<HTMLElement>('#landing')!.hidden = false;
   document.querySelector<HTMLElement>('#session-view')!.hidden = true;
   renderSessions();
   void refreshSessions();
+}
+
+// Focus mode hides the header and session sidebar so the terminal and
+// composer — the actual chat area — get the full viewport. It only makes
+// sense while a session is open, so leaving for the landing page clears it.
+function setFocusMode(enabled: boolean): void {
+  focusMode = enabled;
+  document.body.classList.toggle('focus-mode', enabled);
+  const button = document.querySelector<HTMLButtonElement>('[data-action="toggle-focus"]')!;
+  button.textContent = enabled ? '⤢ Exit focus' : '⛶ Focus';
+  button.setAttribute('aria-pressed', String(enabled));
+  scheduleFit();
 }
 
 // Session state/activity can change while you're off viewing another

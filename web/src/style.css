@@ -84,6 +84,15 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
 #terminal { flex: 1 1 auto; min-height: 300px; padding: 12px; border: 1px solid #24364b; border-radius: 12px; overflow: hidden; background: #07101d; box-shadow: 0 20px 80px rgb(0 0 0 / 28%); }
 .shortcuts { display: flex; gap: 8px; overflow-x: auto; }
 .shortcuts button, select { border: 1px solid #314860; border-radius: 8px; background: #102033; padding: 9px 12px; white-space: nowrap; }
+.shortcuts button[aria-pressed="true"] { border-color: #54e6b1; color: #54e6b1; }
+.shortcuts button.danger { border-color: rgb(255 92 92 / 45%); color: #ff8a8a; }
+
+/* Focus mode: hide the header and sidebar so the terminal + composer take
+   the full viewport. The session-view's own control row (back/focus/close)
+   stays put since it isn't inside either hidden element. */
+body.focus-mode header,
+body.focus-mode nav { display: none; }
+body.focus-mode .layout { grid-template-columns: 1fr; height: 100vh; height: 100dvh; }
 #composer, .pairing { border: 1px solid #24364b; border-radius: 12px; background: #0d1b2c; padding: 12px; }
 #composer label { display: block; margin-bottom: 8px; color: #92a8c2; font-size: 12px; }
 #composer textarea { width: 100%; resize: vertical; border: 0; outline: 0; color: inherit; background: transparent; line-height: 1.45; }
@@ -117,6 +126,7 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
   }
   #terminal .xterm-viewport { overscroll-behavior: contain; }
   #composer, .pairing { scroll-margin-top: 12px; }
+  body.focus-mode .layout { height: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {
