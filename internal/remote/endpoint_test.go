@@ -21,7 +21,7 @@ import (
 	"github.com/SteerMesh/axon/pkg/protocol"
 )
 
-type endpointAdapter struct{ process *endpointProcess }
+type endpointAdapter struct{ process target.Process }
 type endpointProcess struct{ r *io.PipeReader }
 
 func (a endpointAdapter) Kind() string { return "test" }

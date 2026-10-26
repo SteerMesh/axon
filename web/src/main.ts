@@ -28,6 +28,10 @@ function stateLabel(state: string): string {
   return STATE_LABELS[state] ?? state;
 }
 
+function isTerminalState(state: string): boolean {
+  return state === 'finished' || state === 'error';
+}
+
 function relativeTime(iso?: string): string {
   if (!iso) return '';
   const diffMs = Date.now() - Date.parse(iso);
@@ -97,7 +101,10 @@ app.innerHTML = `
           </form>
         </div>
         <div class="landing-sessions">
-          <h2>Remote sessions</h2>
+          <div class="landing-sessions-header">
+            <h2>Remote sessions</h2>
+            <button type="button" id="clear-finished" class="ghost small" hidden>Clear finished</button>
+          </div>
           <div id="landing-session-list" class="session-grid"></div>
           <p id="landing-empty" class="empty">No managed sessions yet — launch one above.</p>
         </div>
@@ -248,6 +255,15 @@ document.querySelector<HTMLButtonElement>('[data-action="close-session"]')!.addE
   }
 });
 
+document.querySelector<HTMLButtonElement>('#clear-finished')!.addEventListener('click', async () => {
+  const button = document.querySelector<HTMLButtonElement>('#clear-finished')!;
+  const finished = sessions.filter((session) => isTerminalState(session.state));
+  if (finished.length === 0) return;
+  button.disabled = true;
+  await Promise.allSettled(finished.map((session) => removeSession(session)));
+  button.disabled = false;
+});
+
 document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('submit', async (event) => {
 	event.preventDefault();
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
@@ -362,7 +378,21 @@ function renderLandingSessions(): void {
     const badge = document.createElement('strong');
     badge.className = `state-badge state-${session.state}`;
     badge.textContent = stateLabel(session.state);
-    header.append(name, badge);
+    const indicators = document.createElement('span');
+    indicators.className = 'session-card-indicators';
+    indicators.append(badge);
+    if (isTerminalState(session.state)) {
+      const dismiss = document.createElement('span');
+      dismiss.className = 'session-card-dismiss';
+      dismiss.textContent = '✕';
+      dismiss.title = 'Remove from the list';
+      dismiss.addEventListener('click', (event) => {
+        event.stopPropagation();
+        void removeSession(session);
+      });
+      indicators.append(dismiss);
+    }
+    header.append(name, indicators);
     const target = document.createElement('small');
     target.textContent = [session.target.kind, ...(session.target.args ?? [])].join(' ');
     const metaParts: string[] = [];
@@ -379,6 +409,21 @@ function renderLandingSessions(): void {
   }));
   const empty = document.querySelector<HTMLElement>('#landing-empty')!;
   empty.hidden = sessions.length > 0;
+  document.querySelector<HTMLButtonElement>('#clear-finished')!.hidden = !sessions.some((session) => isTerminalState(session.state));
+}
+
+// Drops a single terminated session's bookkeeping. The backend refuses to
+// remove anything still running, so this only ever touches sessions that
+// have already finished or errored out.
+async function removeSession(session: SessionSummary): Promise<void> {
+  if (!axonClient) return;
+  try {
+    await axonClient.request('session.remove', undefined, session.id);
+    sessions = sessions.filter((candidate) => candidate.id !== session.id);
+    renderSessions();
+  } catch (error) {
+    showBanner(error instanceof Error ? error.message : String(error), 'error');
+  }
 }
 
 function showBanner(message: string, kind: 'error' | 'info' = 'error'): void {

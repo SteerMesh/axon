@@ -12,6 +12,7 @@ import (
 	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/meshcli"
 	"github.com/SteerMesh/axon/internal/session"
+	"github.com/SteerMesh/axon/internal/target"
 	"github.com/SteerMesh/axon/internal/templates"
 	"github.com/SteerMesh/axon/pkg/protocol"
 )
@@ -47,6 +48,9 @@ func TestDispatcherCommandMatrix(t *testing.T) {
 		{"resize", viewer, requestEnvelope(string(authz.OperationResize), createdSession.ID, "resize", map[string]any{"cols": 90, "rows": 30}), ""},
 		{"signal", owner, requestEnvelope(string(authz.OperationSignal), createdSession.ID, "signal", map[string]any{"signal": "interrupt"}), ""},
 		{"replay", viewer, requestEnvelope("session.replay", createdSession.ID, "replay", map[string]any{"from_seq": 0}), ""},
+		{"remove while running", owner, requestEnvelope(string(authz.OperationRemove), createdSession.ID, "remove-active", nil), "session_active"},
+		{"remove unauthorized", viewer, requestEnvelope(string(authz.OperationRemove), createdSession.ID, "remove-viewer", nil), "unauthorized"},
+		{"remove missing", owner, requestEnvelope(string(authz.OperationRemove), "missing", "remove-missing", nil), "not_found"},
 		{"missing session", owner, requestEnvelope(string(authz.OperationSignal), "missing", "missing", map[string]any{"signal": "kill"}), "not_found"},
 		{"invalid json", owner, protocol.Envelope{Version: 1, ID: "bad-json", Type: string(authz.OperationInput), SessionID: createdSession.ID, Timestamp: time.Now(), IdempotencyKey: "bad", Data: json.RawMessage("{")}, "invalid_message"},
 		{"invalid envelope", owner, protocol.Envelope{Version: 0, ID: "bad", Type: string(authz.OperationList), Timestamp: time.Now()}, "invalid_message"},
@@ -68,6 +72,68 @@ func TestDispatcherCommandMatrix(t *testing.T) {
 		})
 	}
 	_ = w.Close()
+}
+
+// finishableProcess is like endpointProcess but its Wait() can actually
+// return, so tests can drive a session into a terminal state instead of
+// blocking forever (endpointProcess.Wait selects on nothing and never
+// returns, which is fine for tests that don't care about session.remove).
+type finishableProcess struct {
+	r    *io.PipeReader
+	done chan struct{}
+}
+
+func (p *finishableProcess) Write(data []byte) (int, error) { return len(data), nil }
+func (p *finishableProcess) Close() error                   { return p.r.Close() }
+func (p *finishableProcess) Output() io.Reader              { return p.r }
+func (p *finishableProcess) Resize(uint16, uint16) error    { return nil }
+func (p *finishableProcess) Signal(target.Signal) error     { return nil }
+func (p *finishableProcess) Wait() (int, error)             { <-p.done; return 0, nil }
+
+func TestDispatcherRemovesOnlyTerminatedSessions(t *testing.T) {
+	r, w := io.Pipe()
+	process := &finishableProcess{r: r, done: make(chan struct{})}
+	manager := session.NewManager(1024, endpointAdapter{process: process})
+	catalog := templates.Catalog{Templates: map[string]templates.Template{
+		"safe": {Target: "test", Permission: domain.PermissionInteractive},
+	}}
+	dispatcher := NewDispatcher(manager, nil).WithTemplates(catalog)
+	owner := DeviceContext{ID: "owner", Role: authz.RoleOwner}
+
+	created := dispatcher.Handle(context.Background(), owner, requestEnvelope(string(authz.OperationCreate), "", "create-1", map[string]any{"template": "safe", "name": "to-remove"}))
+	if created.Type == "error" {
+		t.Fatalf("create failed: %s", created.Data)
+	}
+	var createdSession domain.Session
+	if err := json.Unmarshal(created.Data, &createdSession); err != nil {
+		t.Fatal(err)
+	}
+
+	if response := dispatcher.Handle(context.Background(), owner, requestEnvelope(string(authz.OperationRemove), createdSession.ID, "remove-active", nil)); response.Type != "error" {
+		t.Fatalf("running session was removed: %+v", response)
+	}
+
+	close(process.done)
+	_ = w.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got, _ := manager.Get(createdSession.ID); got.State == domain.StateFinished {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	response := dispatcher.Handle(context.Background(), owner, requestEnvelope(string(authz.OperationRemove), createdSession.ID, "remove-finished", nil))
+	if response.Type == "error" {
+		t.Fatalf("remove failed: %s", response.Data)
+	}
+	var result map[string]bool
+	if err := json.Unmarshal(response.Data, &result); err != nil || !result["removed"] {
+		t.Fatalf("unexpected remove result: %+v err=%v", result, err)
+	}
+	if _, err := manager.Get(createdSession.ID); err != session.ErrNotFound {
+		t.Fatalf("session still resolvable after remove: err=%v", err)
+	}
 }
 
 func TestDispatcherTemplateAndConfirmationFailures(t *testing.T) {

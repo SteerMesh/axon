@@ -178,6 +178,12 @@ func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request p
 			operationErr = d.manager.Signal(request.SessionID, params.Signal)
 		}
 		result = map[string]bool{"signaled": operationErr == nil}
+	case string(authz.OperationRemove):
+		operationErr = d.authorizeSession(device, request.SessionID, authz.OperationRemove, false)
+		if operationErr == nil {
+			operationErr = d.manager.Remove(request.SessionID)
+		}
+		result = map[string]bool{"removed": operationErr == nil}
 	case string(authz.OperationCreate):
 		var params struct {
 			Template  string `json:"template"`
@@ -271,6 +277,8 @@ func errorCode(err error) string {
 		return "confirmation_required"
 	case errors.Is(err, session.ErrNotFound):
 		return "not_found"
+	case errors.Is(err, session.ErrSessionActive):
+		return "session_active"
 	default:
 		return "invalid_message"
 	}
