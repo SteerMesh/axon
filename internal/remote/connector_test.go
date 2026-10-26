@@ -1,8 +1,10 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/authz"
+	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/relay"
 	"github.com/SteerMesh/axon/internal/security"
 	"github.com/SteerMesh/axon/internal/session"
@@ -39,7 +42,13 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 	if err := persistent.PutDevice(ctx, record, authz.RoleViewer); err != nil {
 		t.Fatal(err)
 	}
-	manager := session.NewManager(1024)
+	r, w := io.Pipe()
+	defer w.Close()
+	manager := session.NewManager(1024, endpointAdapter{process: &endpointProcess{r: r}})
+	managed, err := manager.Create(ctx, "push-test", domain.TargetSpec{Kind: "test"}, domain.PermissionInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
 	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(manager, persistent))
 	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
 	go func() { _ = connector.Run(ctx) }()
@@ -81,6 +90,154 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 	if response.ReplyTo != request.ID {
 		t.Fatalf("unexpected response: %+v", response)
 	}
+
+	subscribe := requestEnvelope("session.subscribe", managed.ID, "subscribe-1", map[string]any{"from_seq": 0})
+	encoded, _ = json.Marshal(subscribe)
+	encrypted, _ = channel.Send.Encrypt(nil, nil, encoded)
+	reply = exchangeRoute(t, ctx, conn, append([]byte{packetTransport}, encrypted...))
+	plaintext, err = channel.Recv.Decrypt(nil, nil, reply[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(plaintext, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ReplyTo != subscribe.ID || response.Epoch != managed.StreamEpoch {
+		t.Fatalf("unexpected subscription response: %+v", response)
+	}
+
+	if _, err := w.Write([]byte("pushed-output")); err != nil {
+		t.Fatal(err)
+	}
+	eventPacket := readRoute(t, ctx, conn)
+	plaintext, err = channel.Recv.Decrypt(nil, nil, eventPacket[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event protocol.Envelope
+	if err := json.Unmarshal(plaintext, &event); err != nil {
+		t.Fatal(err)
+	}
+	var output []byte
+	if err := json.Unmarshal(event.Data, &output); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "session.output" || event.SessionID != managed.ID || event.Sequence != 1 || string(output) != "pushed-output" {
+		t.Fatalf("unexpected pushed event: %+v output=%q", event, output)
+	}
+}
+
+// TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit
+// covers the exact failure a real mesh session with scrollback hits: a
+// single readOutput chunk can be up to 32KB raw, which — after the
+// session.output envelope's base64 data field and the RouteFrame's own
+// base64 payload field — comfortably exceeds coder/websocket's 32768-byte
+// default read limit. Without Connector.runOnce's Dial raising that limit
+// to match the relay (see connector.go), the relay would kill the Mate's
+// connection delivering this, and every other in-flight device would see
+// it as a dropped connection for no reason connected to their own request.
+func TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := relay.NewHub("relay-token")
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	persistent, err := store.Open(filepath.Join(t.TempDir(), "axon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistent.Close()
+	mate, _ := security.GenerateIdentity()
+	device, _ := security.GenerateIdentity()
+	record := security.DeviceRecord{
+		MateID: "mate-1", DeviceID: "device-1", DeviceSigningKey: device.SigningPublic,
+		DeviceNoiseKey: device.Noise.Public, PairedAt: time.Now(), MateSignature: []byte("test"),
+	}
+	if err := persistent.PutDevice(ctx, record, authz.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	r, w := io.Pipe()
+	defer w.Close()
+	manager := session.NewManager(1<<20, endpointAdapter{process: &endpointProcess{r: r}})
+	managed, err := manager.Create(ctx, "push-test", domain.TargetSpec{Kind: "test"}, domain.PermissionInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(manager, persistent))
+	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
+	go func() { _ = connector.Run(ctx) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for !hub.MateConnected("mate-1") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !hub.MateConnected("mate-1") {
+		t.Fatal("Mate did not connect to relay")
+	}
+
+	deviceURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/connect?mate_id=mate-1&role=device&device_id=device-1"
+	header := make(http.Header)
+	header.Set("Authorization", "Bearer relay-token")
+	conn, _, err := websocket.Dial(ctx, deviceURL, &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(relay.MaxFrameBytes)
+	initiator, _ := security.NewIKInitiator(device.Noise, mate.Noise.Public, []byte("mesh-axon-v1:mate-1:device-1"))
+	first, _ := initiator.Start([]byte("device-1"))
+	handshakeReply := exchangeRoute(t, ctx, conn, append([]byte{packetHandshakeInit}, first...))
+	_, channel, err := initiator.Finish(handshakeReply[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subscribe := requestEnvelope("session.subscribe", managed.ID, "subscribe-1", map[string]any{"from_seq": 0})
+	encoded, _ := json.Marshal(subscribe)
+	encrypted, _ := channel.Send.Encrypt(nil, nil, encoded)
+	reply := exchangeRoute(t, ctx, conn, append([]byte{packetTransport}, encrypted...))
+	if _, err := channel.Recv.Decrypt(nil, nil, reply[1:]); err != nil {
+		t.Fatal(err)
+	}
+
+	// A single readOutput chunk can be up to 32KB raw; after double
+	// base64 (the envelope's data field, then the RouteFrame payload
+	// field) that alone clears the library's 32768-byte default.
+	large := bytes.Repeat([]byte("x"), 32<<10)
+	if _, err := w.Write(large); err != nil {
+		t.Fatal(err)
+	}
+	eventPacket := readRoute(t, ctx, conn)
+	plaintext, err := channel.Recv.Decrypt(nil, nil, eventPacket[1:])
+	if err != nil {
+		t.Fatalf("large pushed event did not survive the relay round trip: %v", err)
+	}
+	var event protocol.Envelope
+	if err := json.Unmarshal(plaintext, &event); err != nil {
+		t.Fatal(err)
+	}
+	var output []byte
+	if err := json.Unmarshal(event.Data, &output); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "session.output" || len(output) != len(large) {
+		t.Fatalf("event truncated or malformed: type=%q len=%d", event.Type, len(output))
+	}
+
+	// The Mate's connection to the relay must have survived delivering
+	// that large frame — prove it by completing an unrelated request
+	// over the same connection rather than a fresh reconnect.
+	request := protocol.Envelope{Version: 1, ID: "request-1", Type: "sessions.list", Timestamp: time.Now()}
+	encoded, _ = json.Marshal(request)
+	encrypted, _ = channel.Send.Encrypt(nil, nil, encoded)
+	reply = exchangeRoute(t, ctx, conn, append([]byte{packetTransport}, encrypted...))
+	plaintext, err = channel.Recv.Decrypt(nil, nil, reply[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response protocol.Envelope
+	if err := json.Unmarshal(plaintext, &response); err != nil || response.ReplyTo != request.ID {
+		t.Fatalf("mate did not stay connected after the large frame: response=%+v err=%v", response, err)
+	}
 }
 
 func TestConnectorValidationAndCancellation(t *testing.T) {
@@ -119,12 +276,94 @@ func TestConnectorValidationAndCancellation(t *testing.T) {
 	}
 }
 
+// TestConnectorRepliesWithErrorPacketOnRejectedFrame covers the hang that
+// motivated this change: a device sends a transport packet before (or after
+// losing) an established Noise channel, Handle rejects it, and the device
+// must receive an explicit packetError reply instead of waiting forever for
+// a response the Mate silently dropped.
+func TestConnectorRepliesWithErrorPacketOnRejectedFrame(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := relay.NewHub("relay-token")
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	persistent, err := store.Open(filepath.Join(t.TempDir(), "axon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistent.Close()
+	mate, _ := security.GenerateIdentity()
+	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(session.NewManager(1024), persistent))
+	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
+	go func() { _ = connector.Run(ctx) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for !hub.MateConnected("mate-1") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !hub.MateConnected("mate-1") {
+		t.Fatal("Mate did not connect to relay")
+	}
+
+	deviceURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/connect?mate_id=mate-1&role=device&device_id=device-1"
+	header := make(http.Header)
+	header.Set("Authorization", "Bearer relay-token")
+	conn, _, err := websocket.Dial(ctx, deviceURL, &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	// A transport packet with no prior handshake cannot be satisfied; the
+	// device must still get a reply rather than hang.
+	reply := exchangeRoute(t, ctx, conn, []byte{packetTransport, 1, 2, 3})
+	if reply[0] != packetError {
+		t.Fatalf("expected packetError reply, got kind %d", reply[0])
+	}
+	var detail errorDetail
+	if err := json.Unmarshal(reply[1:], &detail); err != nil {
+		t.Fatalf("error payload was not valid JSON: %v", err)
+	}
+	if detail.Code != "channel_reset_required" {
+		t.Fatalf("unexpected error code: %+v", detail)
+	}
+
+	// The Mate connection itself must have survived the rejection.
+	if !hub.MateConnected("mate-1") {
+		t.Fatal("Mate disconnected after replying with an error packet")
+	}
+}
+
+func TestConnectorBackoffResetsAfterHealthyConnection(t *testing.T) {
+	cases := []struct {
+		name         string
+		connectedFor time.Duration
+		wantReset    bool
+	}{
+		{"well under the window", 9 * time.Second, false},
+		{"just under the window", healthyConnectionWindow - time.Millisecond, false},
+		{"exactly at the window", healthyConnectionWindow, true},
+		{"well past the window", 30 * time.Second, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resetsBackoff(tc.connectedFor); got != tc.wantReset {
+				t.Fatalf("resetsBackoff(%s) = %v, want %v", tc.connectedFor, got, tc.wantReset)
+			}
+		})
+	}
+}
+
 func exchangeRoute(t *testing.T, ctx context.Context, conn *websocket.Conn, payload []byte) []byte {
 	t.Helper()
 	frame, _ := json.Marshal(relay.RouteFrame{Version: 1, MateID: "mate-1", Payload: payload})
 	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
 		t.Fatal(err)
 	}
+	return readRoute(t, ctx, conn)
+}
+
+func readRoute(t *testing.T, ctx context.Context, conn *websocket.Conn) []byte {
+	t.Helper()
 	_, data, err := conn.Read(ctx)
 	if err != nil {
 		t.Fatal(err)

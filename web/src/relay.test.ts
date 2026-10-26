@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NoiseChannel } from './crypto/noiseIK';
-import { SecureTransport } from './relay';
+import { mateRejection, SecureTransport } from './relay';
 
 class FakeRelay {
   sent?: Uint8Array;
@@ -49,5 +49,32 @@ describe('SecureTransport', () => {
     const transport = new SecureTransport(relay, identityChannel());
 
     await expect(transport.receive()).rejects.toThrow('invalid encrypted transport packet');
+  });
+
+  it('surfaces a mate error packet instead of hanging or decrypting it', async () => {
+    const relay = new FakeRelay();
+    relay.incoming = new Uint8Array([
+      5,
+      ...new TextEncoder().encode(JSON.stringify({ code: 'channel_reset_required', message: 'pair again' })),
+    ]);
+    const transport = new SecureTransport(relay, identityChannel());
+
+    await expect(transport.receive()).rejects.toThrow('pair again');
+  });
+});
+
+describe('mateRejection', () => {
+  it('prefers the message field over the code', () => {
+    const payload = new TextEncoder().encode(JSON.stringify({ code: 'device_revoked', message: 'this device has been revoked' }));
+    expect(mateRejection(payload).message).toBe('this device has been revoked');
+  });
+
+  it('falls back to the code when there is no message', () => {
+    const payload = new TextEncoder().encode(JSON.stringify({ code: 'device_revoked' }));
+    expect(mateRejection(payload).message).toBe('device_revoked');
+  });
+
+  it('falls back to a generic message for malformed payloads', () => {
+    expect(mateRejection(new Uint8Array([1, 2, 3])).message).toBe('the mate rejected this request');
   });
 });

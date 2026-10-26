@@ -44,9 +44,10 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
 .session small { color: #6f86a0; font-size: 10px; }
 .session strong { color: #f2cb62; font-size: 12px; }
 .empty { color: #6f86a0; font-size: 12px; line-height: 1.5; }
-.session-launch { margin-top: 18px; border-top: 1px solid #24364b; padding-top: 14px; }
-.session-launch summary { cursor: pointer; color: #92a8c2; font-size: 12px; font-weight: 700; }
-#session-form { display: grid; gap: 8px; margin-top: 12px; }
+.ghost { width: 100%; margin-top: 14px; border: 1px dashed #314860; border-radius: 10px; background: transparent; color: #92a8c2; padding: 10px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.ghost:disabled { cursor: wait; opacity: .5; }
+.ghost.small { width: auto; margin-top: 0; padding: 6px 10px; font-size: 11px; }
+#session-form { display: grid; gap: 8px; margin-top: 14px; }
 #session-form label { color: #92a8c2; font-size: 11px; }
 #session-form label span { color: #6f86a0; }
 #session-form input, #session-form select { width: 100%; min-width: 0; border: 1px solid #314860; border-radius: 8px; background: #07101d; color: inherit; padding: 9px; }
@@ -56,14 +57,50 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
   min-height: 0;
   height: 100%;
   padding: 16px;
-  display: grid;
-  grid-template-rows: minmax(300px, 1fr) auto auto auto;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   overflow-y: auto;
 }
-#terminal { min-height: 0; height: 100%; padding: 12px; border: 1px solid #24364b; border-radius: 12px; overflow: hidden; background: #07101d; box-shadow: 0 20px 80px rgb(0 0 0 / 28%); }
+.banner { margin: 0; padding: 10px 14px; border-radius: 10px; font-size: 13px; }
+.banner.error { background: rgb(255 92 92 / 12%); color: #ff8a8a; border: 1px solid rgb(255 92 92 / 35%); }
+.banner.info { background: rgb(84 230 177 / 10%); color: #8be8c8; border: 1px solid rgb(84 230 177 / 30%); }
+.landing { display: grid; gap: 16px; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr); align-items: start; }
+.landing[hidden] { display: none; }
+.landing-launch, .landing-sessions { border: 1px solid #24364b; border-radius: 12px; background: #0d1b2c; padding: 16px; }
+.landing-launch h2, .landing-sessions h2 { margin-bottom: 4px; }
+.landing-sessions-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.landing-sessions-header h2 { margin-bottom: 0; }
+.session-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 12px; }
+.session-card { width: 100%; display: grid; gap: 6px; padding: 12px; border: 1px solid #2a4058; border-radius: 10px; background: #102033; text-align: left; cursor: pointer; }
+.session-card.active { border-color: #54e6b1; box-shadow: 0 0 0 1px rgb(84 230 177 / 22%); }
+.session-card-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.session-card-header b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-card-indicators { display: flex; align-items: center; gap: 6px; flex: none; }
+.session-card-dismiss { display: grid; place-items: center; width: 18px; height: 18px; border-radius: 999px; color: #6f86a0; font-size: 11px; line-height: 1; }
+.session-card-dismiss:hover { color: #ff8a8a; background: rgb(255 92 92 / 14%); }
+.session-card > small { color: #6f86a0; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-card-meta { color: #536a85; font-size: 10px; }
+.state-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
+.state-badge.state-running { color: #54e6b1; background: rgb(84 230 177 / 14%); }
+.state-badge.state-waiting_input { color: #f2cb62; background: rgb(242 203 98 / 14%); }
+.state-badge.state-idle { color: #92a8c2; background: rgb(146 168 194 / 14%); }
+.state-badge.state-finished { color: #6f86a0; background: rgb(111 134 160 / 14%); }
+.state-badge.state-error { color: #ff8a8a; background: rgb(255 92 92 / 14%); }
+#session-view { display: flex; flex-direction: column; gap: 12px; min-height: 0; flex: 1 1 auto; }
+#session-view[hidden] { display: none; }
+#terminal { flex: 1 1 auto; min-height: 300px; padding: 12px; border: 1px solid #24364b; border-radius: 12px; overflow: hidden; background: #07101d; box-shadow: 0 20px 80px rgb(0 0 0 / 28%); }
 .shortcuts { display: flex; gap: 8px; overflow-x: auto; }
 .shortcuts button, select { border: 1px solid #314860; border-radius: 8px; background: #102033; padding: 9px 12px; white-space: nowrap; }
+.shortcuts button[aria-pressed="true"] { border-color: #54e6b1; color: #54e6b1; }
+.shortcuts button.danger { border-color: rgb(255 92 92 / 45%); color: #ff8a8a; }
+
+/* Focus mode: hide the header and sidebar so the terminal + composer take
+   the full viewport. The session-view's own control row (back/focus/close)
+   stays put since it isn't inside either hidden element. */
+body.focus-mode header,
+body.focus-mode nav { display: none; }
+body.focus-mode .layout { grid-template-columns: 1fr; height: 100vh; height: 100dvh; }
 #composer, .pairing { border: 1px solid #24364b; border-radius: 12px; background: #0d1b2c; padding: 12px; }
 #composer label { display: block; margin-bottom: 8px; color: #92a8c2; font-size: 12px; }
 #composer textarea { width: 100%; resize: vertical; border: 0; outline: 0; color: inherit; background: transparent; line-height: 1.45; }
@@ -79,6 +116,8 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
   nav { padding: 14px 10px; border-right: 0; border-bottom: 1px solid #24364b; }
   #session-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
   .session { margin-top: 8px; }
+  .landing { grid-template-columns: 1fr; }
+  .session-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
   .terminal-panel {
     display: flex;
     flex-direction: column;
@@ -95,6 +134,7 @@ nav { padding: 22px 14px; border-right: 1px solid #24364b; }
   }
   #terminal .xterm-viewport { overscroll-behavior: contain; }
   #composer, .pairing { scroll-margin-top: 12px; }
+  body.focus-mode .layout { height: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

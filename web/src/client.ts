@@ -1,4 +1,8 @@
 import type { SecureTransport } from './relay';
+import { withTimeout } from './timeout';
+
+/** How long a single request may wait for a reply before it is abandoned. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 interface Envelope<T = unknown> {
   v: 1;
@@ -6,6 +10,8 @@ interface Envelope<T = unknown> {
   reply_to?: string;
   type: string;
   sid?: string;
+  epoch?: string;
+  seq?: number;
   ts: string;
   idempotency_key?: string;
   data?: T;
@@ -16,17 +22,20 @@ interface PendingRequest {
   reject: (error: Error) => void;
 }
 
+type EventHandler = (envelope: Envelope) => void;
+
 export class AxonClient {
-  readonly #transport: SecureTransport;
+  readonly #transport: Pick<SecureTransport, 'send' | 'receive' | 'close'>;
   readonly #pending = new Map<string, PendingRequest>();
+  readonly #handlers = new Map<string, Set<EventHandler>>();
   #closed = false;
 
-  constructor(transport: SecureTransport) {
+  constructor(transport: Pick<SecureTransport, 'send' | 'receive' | 'close'>) {
     this.#transport = transport;
     void this.#readLoop();
   }
 
-  request<T>(type: string, data?: unknown, sessionId?: string): Promise<Envelope<T>> {
+  request<T>(type: string, data?: unknown, sessionId?: string, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Envelope<T>> {
     if (this.#closed) return Promise.reject(new Error('Axon connection is closed'));
     const id = crypto.randomUUID();
     const envelope: Envelope = {
@@ -39,10 +48,28 @@ export class AxonClient {
       ...(data === undefined ? {} : { data }),
     };
     this.#transport.send(envelope);
-    return new Promise<Envelope<T>>((resolve, reject) => this.#pending.set(id, {
+    const settled = new Promise<Envelope<T>>((resolve, reject) => this.#pending.set(id, {
       resolve: resolve as (value: Envelope) => void,
       reject,
     }));
+    // A request that never gets a reply (relay/mate silently drops it, or
+    // the device simply never hears back) must still resolve the promise
+    // the UI is awaiting, so it cannot hang indefinitely.
+    return withTimeout(settled, timeoutMs, `${type} request timed out`).catch((error: unknown) => {
+      this.#pending.delete(id);
+      throw error;
+    });
+  }
+
+  on<T>(type: string, handler: (envelope: Envelope<T>) => void): () => void {
+    const handlers = this.#handlers.get(type) ?? new Set<EventHandler>();
+    const eventHandler = handler as EventHandler;
+    handlers.add(eventHandler);
+    this.#handlers.set(type, handlers);
+    return () => {
+      handlers.delete(eventHandler);
+      if (handlers.size === 0) this.#handlers.delete(type);
+    };
   }
 
   close(): void {
@@ -56,7 +83,10 @@ export class AxonClient {
     try {
       while (!this.#closed) {
         const envelope = await this.#transport.receive<Envelope>();
-        if (!envelope.reply_to) continue;
+        if (!envelope.reply_to) {
+          for (const handler of this.#handlers.get(envelope.type) ?? []) handler(envelope);
+          continue;
+        }
         const pending = this.#pending.get(envelope.reply_to);
         if (!pending) continue;
         this.#pending.delete(envelope.reply_to);
