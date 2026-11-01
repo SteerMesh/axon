@@ -2,8 +2,9 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { pairAndConnect } from './pairing';
+import { MateKeyMismatchError, type PairedConnection, pairAndConnect, reconnectToMate } from './pairing';
 import { AxonClient } from './client';
+import { deleteMate, listMates, type PairedMate } from './mateStore';
 
 interface SessionSummary {
   id: string;
@@ -76,7 +77,15 @@ app.innerHTML = `
     </nav>
     <article class="terminal-panel">
       <p id="banner" class="banner" hidden></p>
-      <details class="pairing" open>
+      <section id="device-picker" class="picker" hidden>
+        <h2>Known devices</h2>
+        <p class="empty">Reconnect to a previously paired mate without scanning a QR code again.</p>
+        <label for="picker-relay-ticket">Relay access ticket</label>
+        <input id="picker-relay-ticket" type="password" required autocomplete="off" />
+        <div id="mate-list" class="session-grid"></div>
+        <button type="button" id="picker-pair-new" class="ghost">+ Pair a new device</button>
+      </section>
+      <details class="pairing" hidden>
         <summary>Pair this device</summary>
         <form id="pairing-form">
           <label for="pairing-payload">Pairing payload</label>
@@ -156,7 +165,7 @@ fit.fit();
 terminal.writeln('\x1b[38;2;84;230;177mMesh Axon\x1b[0m secure session client');
 terminal.writeln('Pair a device to begin.');
 
-let secureConnection: Awaited<ReturnType<typeof pairAndConnect>> | undefined;
+let secureConnection: PairedConnection | undefined;
 let axonClient: AxonClient | undefined;
 let activeSessionId = '';
 let activeEpoch = '';
@@ -274,40 +283,146 @@ document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('subm
 			document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value.trim(),
 			document.querySelector<HTMLInputElement>('#relay-ticket')!.value,
 		);
-		axonClient?.close();
-		secureConnection = paired;
-		activeSessionId = '';
-		axonClient = new AxonClient(secureConnection.transport);
-		axonClient.on<string>('session.output', (event) => {
-			if (event.sid !== activeSessionId || (activeEpoch && event.epoch !== activeEpoch)) return;
-			if (event.seq === undefined || event.seq < nextSequence || !event.data) return;
-			terminal.write(fromBase64Text(event.data));
-			nextSequence = event.seq + 1;
-		});
-		axonClient.on('session.closed', (event) => {
-			if (event.sid !== activeSessionId) return;
-			terminal.writeln('\r\n\x1b[33mSession finished.\x1b[0m');
-			const session = sessions.find((candidate) => candidate.id === event.sid);
-			if (session) session.state = 'finished';
-			renderSessions();
-		});
-		axonClient.on('session.resync', (event) => {
-			if (event.sid !== activeSessionId || (activeEpoch && event.epoch !== activeEpoch)) return;
-			terminal.writeln('\r\n\x1b[33mLive output fell behind; resynchronizing…\x1b[0m');
-			void subscribeSession(event.sid, nextSequence);
-		});
-		state.textContent = 'Encrypted';
-		showBanner(`Paired with ${secureConnection.mateId}.`, 'info');
-		await loadMeshOptions();
-		document.querySelector<HTMLButtonElement>('#session-form button')!.disabled = false;
-		document.querySelector<HTMLButtonElement>('#quick-launch')!.disabled = false;
-		document.querySelector<HTMLDetailsElement>('.pairing')!.open = false;
-		showLanding();
+		await onConnected(paired);
 	} catch (error) {
 		state.textContent = 'Pairing failed';
 		showBanner(error instanceof Error ? error.message : String(error), 'error');
 	}
 });
+
+document.querySelector<HTMLButtonElement>('#picker-pair-new')!.addEventListener('click', () => {
+	document.querySelector<HTMLElement>('#device-picker')!.hidden = true;
+	const pairing = document.querySelector<HTMLDetailsElement>('.pairing')!;
+	pairing.hidden = false;
+	pairing.open = true;
+});
+
+void refreshDevicePicker();
+
+// Shared by both the QR-pairing flow and the device-picker's reconnect
+// flow: once a secure transport exists, wiring the client up to the UI is
+// identical regardless of how the connection was established.
+async function onConnected(paired: PairedConnection): Promise<void> {
+	const state = document.querySelector<HTMLElement>('#connection-state')!;
+	axonClient?.close();
+	secureConnection = paired;
+	activeSessionId = '';
+	axonClient = new AxonClient(secureConnection.transport);
+	axonClient.on<string>('session.output', (event) => {
+		if (event.sid !== activeSessionId || (activeEpoch && event.epoch !== activeEpoch)) return;
+		if (event.seq === undefined || event.seq < nextSequence || !event.data) return;
+		terminal.write(fromBase64Text(event.data));
+		nextSequence = event.seq + 1;
+	});
+	axonClient.on('session.closed', (event) => {
+		if (event.sid !== activeSessionId) return;
+		terminal.writeln('\r\n\x1b[33mSession finished.\x1b[0m');
+		const session = sessions.find((candidate) => candidate.id === event.sid);
+		if (session) session.state = 'finished';
+		renderSessions();
+	});
+	axonClient.on('session.resync', (event) => {
+		if (event.sid !== activeSessionId || (activeEpoch && event.epoch !== activeEpoch)) return;
+		terminal.writeln('\r\n\x1b[33mLive output fell behind; resynchronizing…\x1b[0m');
+		void subscribeSession(event.sid, nextSequence);
+	});
+	state.textContent = 'Encrypted';
+	showBanner(`Paired with ${secureConnection.mateId}.`, 'info');
+	await loadMeshOptions();
+	document.querySelector<HTMLButtonElement>('#session-form button')!.disabled = false;
+	document.querySelector<HTMLButtonElement>('#quick-launch')!.disabled = false;
+	document.querySelector<HTMLDetailsElement>('.pairing')!.open = false;
+	document.querySelector<HTMLElement>('.pairing')!.hidden = true;
+	document.querySelector<HTMLElement>('#device-picker')!.hidden = true;
+	showLanding();
+}
+
+// Shows the device picker when mates are already known, or falls back to
+// the QR pairing form (e.g. first run, or IndexedDB unavailable/blocked).
+async function refreshDevicePicker(): Promise<void> {
+	let mates: PairedMate[] = [];
+	try {
+		mates = await listMates();
+	} catch {
+		// fall through to the pairing form below
+	}
+	const picker = document.querySelector<HTMLElement>('#device-picker')!;
+	const pairing = document.querySelector<HTMLDetailsElement>('.pairing')!;
+	if (mates.length === 0) {
+		picker.hidden = true;
+		pairing.hidden = false;
+		pairing.open = true;
+		return;
+	}
+	renderMateList(mates);
+	picker.hidden = false;
+	pairing.hidden = true;
+}
+
+function renderMateList(mates: PairedMate[]): void {
+	const list = document.querySelector<HTMLElement>('#mate-list')!;
+	list.replaceChildren(...mates.map((mate) => {
+		const card = document.createElement('div');
+		card.className = 'session-card mate-card';
+		const header = document.createElement('div');
+		header.className = 'session-card-header';
+		const name = document.createElement('b');
+		name.textContent = mate.mateId;
+		header.append(name);
+		const meta = document.createElement('small');
+		meta.className = 'session-card-meta';
+		meta.textContent = `Last connected ${relativeTime(new Date(mate.lastConnectedAt).toISOString())}`;
+		const actions = document.createElement('div');
+		actions.className = 'mate-card-actions';
+		const connect = document.createElement('button');
+		connect.type = 'button';
+		connect.className = 'primary';
+		connect.textContent = 'Connect';
+		connect.addEventListener('click', () => void connectToMate(mate, connect));
+		const forget = document.createElement('button');
+		forget.type = 'button';
+		forget.className = 'ghost';
+		forget.textContent = 'Forget';
+		forget.addEventListener('click', () => void forgetMate(mate));
+		actions.append(connect, forget);
+		card.append(header, meta, actions);
+		return card;
+	}));
+}
+
+async function connectToMate(mate: PairedMate, button: HTMLButtonElement): Promise<void> {
+	const ticket = document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value;
+	if (!ticket) {
+		showBanner('Enter the relay access ticket to reconnect.', 'error');
+		return;
+	}
+	const state = document.querySelector<HTMLElement>('#connection-state')!;
+	button.disabled = true;
+	state.textContent = 'Connecting…';
+	hideBanner();
+	try {
+		const paired = await reconnectToMate(mate, ticket);
+		await onConnected(paired);
+	} catch (error) {
+		state.textContent = 'Connection failed';
+		if (error instanceof MateKeyMismatchError) {
+			showBanner(`${error.message} Use "Pair a new device" below to continue.`, 'error');
+		} else {
+			showBanner(error instanceof Error ? error.message : String(error), 'error');
+		}
+	} finally {
+		button.disabled = false;
+	}
+}
+
+async function forgetMate(mate: PairedMate): Promise<void> {
+	try {
+		await deleteMate(mate.mateId);
+		await refreshDevicePicker();
+	} catch (error) {
+		showBanner(error instanceof Error ? error.message : String(error), 'error');
+	}
+}
 
 function bytesBase64(value: Uint8Array): string {
 	let binary = '';

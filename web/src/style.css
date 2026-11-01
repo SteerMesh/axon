@@ -111,6 +111,15 @@ body.focus-mode .layout { grid-template-columns: 1fr; height: 100vh; height: 100
 #pairing-form label { color: #92a8c2; font-size: 12px; }
 #pairing-form textarea, #pairing-form input { width: 100%; border: 1px solid #314860; border-radius: 8px; background: #07101d; color: inherit; padding: 10px; }
 
+.picker { border: 1px solid #24364b; border-radius: 12px; background: #0d1b2c; padding: 16px; }
+.picker[hidden] { display: none; }
+.picker label { display: block; margin-top: 10px; color: #92a8c2; font-size: 12px; }
+.picker input { width: 100%; max-width: 360px; border: 1px solid #314860; border-radius: 8px; background: #07101d; color: inherit; padding: 9px; }
+.picker .session-grid { margin-top: 14px; }
+.mate-card { cursor: default; }
+.mate-card-actions { display: flex; gap: 8px; margin-top: 4px; }
+.mate-card-actions button { flex: 1; width: auto; margin-top: 0; padding: 7px 10px; font-size: 12px; border-radius: 8px; }
+
 @media (max-width: 720px) {
   .layout { display: block; height: auto; min-height: 0; }
   nav { padding: 14px 10px; border-right: 0; border-bottom: 1px solid #24364b; }

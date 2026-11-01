@@ -1,5 +1,6 @@
 import { NoiseIKInitiator } from './crypto/noiseIK';
 import { loadOrCreateIdentity } from './identityStore';
+import { type PairedMate, saveMate, touchLastConnected } from './mateStore';
 import { base64, base64URL, fromBase64, mateRejection, RelayTransport, SecureTransport } from './relay';
 import { withTimeout } from './timeout';
 
@@ -73,12 +74,97 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
     if (handshakeReply[0] === 5) throw mateRejection(handshakeReply.slice(1));
     if (handshakeReply[0] !== 2) throw new Error('Mate rejected the encrypted channel');
     const { channel } = await initiator.finish(handshakeReply.slice(1));
+    try {
+      // Remember this mate so the device can reconnect later without
+      // re-scanning the QR code. Losing this is a worse UX, not a failed
+      // pairing — don't let a storage problem undo a connection that
+      // otherwise succeeded.
+      await saveMate({
+        mateId: bundle.mate_id,
+        noisePublicKey: fromBase64(bundle.mate_noise_key),
+        signingPublicKey: fromBase64(bundle.mate_signing_key),
+        relayUrl: bundle.relay_url,
+        lastConnectedAt: Date.now(),
+      });
+    } catch {
+      // ignored — see comment above
+    }
     return { deviceId, mateId: bundle.mate_id, transport: new SecureTransport(relay, channel) };
   } catch (error) {
     // A failed or timed-out pairing attempt must not leave a stale device
     // socket registered on the relay — that blocks every retry until the
     // old tab is closed (see the Axon handoff notes on this exact pain
     // point).
+    relay.close();
+    throw error;
+  }
+}
+
+/**
+ * Thrown by {@link reconnectToMate} when the mate's live handshake doesn't
+ * authenticate against the Noise key recorded at pairing time — most
+ * plausibly because the mate rotated or revoked its key since. Distinct
+ * from a network/offline failure so the UI can specifically prompt
+ * re-pairing instead of showing a raw crypto error.
+ */
+export class MateKeyMismatchError extends Error {
+  readonly mateId: string;
+
+  constructor(mateId: string) {
+    super(`"${mateId}" did not authenticate with its previously known key — re-pair this device to continue.`);
+    this.name = 'MateKeyMismatchError';
+    this.mateId = mateId;
+  }
+}
+
+/**
+ * Reconnects to a previously paired mate using its stored keys and relay
+ * URL — skipping the QR scan and signed DeviceRecord exchange that
+ * {@link pairAndConnect} performs, since the device and mate already trust
+ * each other's long-term keys. Only a fresh Noise IK handshake is needed.
+ *
+ * `relayTicket` is the same relay access ticket used during pairing. The
+ * relay (see `internal/relay/hub.go`) checks it as a static shared secret,
+ * not a one-time token, so it is safe to reuse across reconnects — it is
+ * intentionally not persisted in {@link PairedMate}, so the caller must
+ * supply it again (e.g. by prompting the user).
+ */
+export async function reconnectToMate(mate: PairedMate, relayTicket: string): Promise<PairedConnection> {
+  const identity = await loadOrCreateIdentity();
+  const deviceId = await deviceIdentifier(identity.signingPublicKey);
+
+  const relay = new RelayTransport(mate.relayUrl, mate.mateId, deviceId, relayTicket);
+  await relay.opened();
+  try {
+    const prologue = new TextEncoder().encode(`mesh-axon-v1:${mate.mateId}:${deviceId}`);
+    const initiator = new NoiseIKInitiator(identity.noiseKeyPair, mate.noisePublicKey, prologue);
+    relay.send(packet(1, await initiator.start(new TextEncoder().encode(deviceId))));
+    const handshakeReply = await withTimeout(relay.receive(), PAIRING_STEP_TIMEOUT_MS, 'handshake timed out waiting for the mate');
+    if (handshakeReply[0] === 5) throw mateRejection(handshakeReply.slice(1));
+    if (handshakeReply[0] !== 2) throw new Error('Mate rejected the encrypted channel');
+
+    let channel;
+    try {
+      ({ channel } = await initiator.finish(handshakeReply.slice(1)));
+    } catch {
+      // Noise IK mixes the responder's static key (mate.noisePublicKey) into
+      // the handshake before any data is exchanged, so a mate that no
+      // longer holds the matching private key fails authentication here —
+      // it does not "succeed" with some other key. That failure is
+      // indistinguishable, at this layer, from key rotation/revocation.
+      throw new MateKeyMismatchError(mate.mateId);
+    }
+
+    try {
+      // Same reasoning as the saveMate call in pairAndConnect: a Noise
+      // handshake that just succeeded must not be torn down because a
+      // bookkeeping write (last-connected timestamp) failed afterwards.
+      await touchLastConnected(mate.mateId);
+    } catch {
+      // ignored — see comment above
+    }
+    return { deviceId, mateId: mate.mateId, transport: new SecureTransport(relay, channel) };
+  } catch (error) {
     relay.close();
     throw error;
   }
