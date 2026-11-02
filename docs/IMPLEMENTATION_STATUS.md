@@ -61,12 +61,15 @@ used to be handed directly, so an operator must provision
 AXON_RELAY_MATE_KEYS=mate-id-1=<base64url-public-key>,mate-id-2=<base64url-public-key>
 ```
 
-Each mate already prints its base64url-encoded public signing key as part of
-its identity (`security.PublicKeyString`); there is nothing to generate —
-only to copy from each mate into the relay's configuration. A relay started
-without `AXON_RELAY_MATE_KEYS` (or with it empty) now refuses to start.
-Mates no longer take a `--relay-token` flag or read `AXON_RELAY_TOKEN` at
-all; that configuration can be removed from mate deployments.
+Run `mesh-axon identity` on each mate to get the `mate_id=base64url-pubkey`
+value to add to the relay's `AXON_RELAY_MATE_KEYS`; it reads (or lazily
+creates) that mate's identity file directly and prints its `mate_id`,
+public signing key, and a ready-to-paste `AXON_RELAY_MATE_KEYS` fragment --
+no running `serve` daemon required, and it never prints either private
+key. A relay started without `AXON_RELAY_MATE_KEYS` (or with it empty) now
+refuses to start. Mates no longer take a `--relay-token` flag or read
+`AXON_RELAY_TOKEN` at all; that configuration can be removed from mate
+deployments.
 
 ## Production hardening remaining
 

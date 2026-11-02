@@ -55,7 +55,7 @@ func newRoot(defaultSocket string) *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&socketPath, "socket", defaultSocket, "Axon Agent Unix socket")
-	root.AddCommand(newServeCommand(), newRunCommand(), newSessionsCommand(), newAttachCommand(), newSignalCommand(), newStatusCommand(), newServiceCommand(), newPairCommand(), newDevicesCommand())
+	root.AddCommand(newServeCommand(), newRunCommand(), newSessionsCommand(), newAttachCommand(), newSignalCommand(), newStatusCommand(), newServiceCommand(), newPairCommand(), newDevicesCommand(), newIdentityCommand())
 	return root
 }
 
@@ -362,6 +362,37 @@ func newDevicesCommand() *cobra.Command {
 		},
 	})
 	return devices
+}
+
+func newIdentityCommand() *cobra.Command {
+	var mateID, dataDir string
+	command := &cobra.Command{
+		Use:   "identity",
+		Short: "Print this mate's ID and public signing key for relay provisioning",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if dataDir == "" {
+				home, err := os.UserHomeDir()
+				if err != nil {
+					return err
+				}
+				dataDir = filepath.Join(home, ".mesh", "axon")
+			}
+			identity, err := security.LoadOrCreateIdentity(filepath.Join(dataDir, "identity.json"))
+			if err != nil {
+				return err
+			}
+			if mateID == "" {
+				mateID = security.IdentityID(identity)
+			}
+			publicKey := security.PublicKeyString(identity.SigningPublic)
+			fmt.Printf("Mate ID:    %s\nPublic key: %s\n\n", mateID, publicKey)
+			fmt.Printf("AXON_RELAY_MATE_KEYS fragment: %s=%s\n", mateID, publicKey)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&mateID, "mate-id", "", "Stable host identity (derived from the signing key by default)")
+	command.Flags().StringVar(&dataDir, "data-dir", "", "Agent state directory (default ~/.mesh/axon)")
+	return command
 }
 
 func agentUnavailable(err error) error {
