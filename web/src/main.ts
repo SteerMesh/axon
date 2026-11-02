@@ -2,9 +2,10 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { MateKeyMismatchError, type PairedConnection, pairAndConnect, reconnectToMate } from './pairing';
+import { currentDeviceId, MateKeyMismatchError, type PairedConnection, pairAndConnect, reconnectToMate } from './pairing';
 import { AxonClient } from './client';
 import { deleteMate, listMates, type PairedMate } from './mateStore';
+import { disableWakeNotifications, enableWakeNotifications } from './push';
 
 interface SessionSummary {
   id: string;
@@ -56,8 +57,13 @@ interface MeshOptions {
 // it more room than the client's default request timeout before giving up.
 const SESSION_CREATE_TIMEOUT_MS = 30_000;
 
+let serviceWorkerRegistration: ServiceWorkerRegistration | undefined;
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').then((registration) => {
+      serviceWorkerRegistration = registration;
+    });
+  });
 }
 
 const app = document.querySelector<HTMLElement>('#app');
@@ -276,14 +282,15 @@ document.querySelector<HTMLButtonElement>('#clear-finished')!.addEventListener('
 document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('submit', async (event) => {
 	event.preventDefault();
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
+	const relayTicket = document.querySelector<HTMLInputElement>('#relay-ticket')!.value;
 	state.textContent = 'Pairing…';
 	hideBanner();
 	try {
 		const paired = await pairAndConnect(
 			document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value.trim(),
-			document.querySelector<HTMLInputElement>('#relay-ticket')!.value,
+			relayTicket,
 		);
-		await onConnected(paired);
+		await onConnected(paired, relayTicket);
 	} catch (error) {
 		state.textContent = 'Pairing failed';
 		showBanner(error instanceof Error ? error.message : String(error), 'error');
@@ -302,7 +309,12 @@ void refreshDevicePicker();
 // Shared by both the QR-pairing flow and the device-picker's reconnect
 // flow: once a secure transport exists, wiring the client up to the UI is
 // identical regardless of how the connection was established.
-async function onConnected(paired: PairedConnection): Promise<void> {
+//
+// `relayTicket` is also used -- best-effort -- to register this device for
+// Web Push wake notifications. A browser without push support, a denied
+// permission, or an unreachable relay must never affect an otherwise
+// working connection, so that failure is swallowed silently.
+async function onConnected(paired: PairedConnection, relayTicket: string): Promise<void> {
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
 	axonClient?.close();
 	secureConnection = paired;
@@ -328,6 +340,13 @@ async function onConnected(paired: PairedConnection): Promise<void> {
 	});
 	state.textContent = 'Encrypted';
 	showBanner(`Paired with ${secureConnection.mateId}.`, 'info');
+	if (serviceWorkerRegistration && 'PushManager' in window) {
+		void enableWakeNotifications(
+			serviceWorkerRegistration,
+			{ relayUrl: secureConnection.relayUrl, relayTicket, mateId: secureConnection.mateId, deviceId: secureConnection.deviceId },
+			Notification,
+		);
+	}
 	await loadMeshOptions();
 	document.querySelector<HTMLButtonElement>('#session-form button')!.disabled = false;
 	document.querySelector<HTMLButtonElement>('#quick-launch')!.disabled = false;
@@ -402,7 +421,7 @@ async function connectToMate(mate: PairedMate, button: HTMLButtonElement): Promi
 	hideBanner();
 	try {
 		const paired = await reconnectToMate(mate, ticket);
-		await onConnected(paired);
+		await onConnected(paired, ticket);
 	} catch (error) {
 		state.textContent = 'Connection failed';
 		if (error instanceof MateKeyMismatchError) {
@@ -415,12 +434,29 @@ async function connectToMate(mate: PairedMate, button: HTMLButtonElement): Promi
 	}
 }
 
+// Forgetting a mate removes its local pairing record. Push-subscription
+// cleanup is best-effort and layered on top -- it must never block or fail
+// the forget action itself. The relay ticket is optional here (the picker
+// field may be empty if the user never typed one for this mate); without
+// it the relay-side DELETE just comes back unauthorized and the row is
+// instead pruned the next time the relay gets a 404/410 pushing to it.
 async function forgetMate(mate: PairedMate): Promise<void> {
 	try {
 		await deleteMate(mate.mateId);
 		await refreshDevicePicker();
 	} catch (error) {
 		showBanner(error instanceof Error ? error.message : String(error), 'error');
+	}
+	if (serviceWorkerRegistration && 'PushManager' in window) {
+		const relayTicket = document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value;
+		void currentDeviceId()
+			.then((deviceId) => disableWakeNotifications(
+				serviceWorkerRegistration!,
+				{ relayUrl: mate.relayUrl, relayTicket, mateId: mate.mateId, deviceId },
+			))
+			.catch(() => {
+				// Best-effort: see the comment above.
+			});
 	}
 }
 

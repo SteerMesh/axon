@@ -28,6 +28,7 @@ interface DeviceRecord {
 export interface PairedConnection {
   deviceId: string;
   mateId: string;
+  relayUrl: string;
   transport: SecureTransport;
 }
 
@@ -89,7 +90,7 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
     } catch {
       // ignored — see comment above
     }
-    return { deviceId, mateId: bundle.mate_id, transport: new SecureTransport(relay, channel) };
+    return { deviceId, mateId: bundle.mate_id, relayUrl: bundle.relay_url, transport: new SecureTransport(relay, channel) };
   } catch (error) {
     // A failed or timed-out pairing attempt must not leave a stale device
     // socket registered on the relay — that blocks every retry until the
@@ -163,7 +164,7 @@ export async function reconnectToMate(mate: PairedMate, relayTicket: string): Pr
     } catch {
       // ignored — see comment above
     }
-    return { deviceId, mateId: mate.mateId, transport: new SecureTransport(relay, channel) };
+    return { deviceId, mateId: mate.mateId, relayUrl: mate.relayUrl, transport: new SecureTransport(relay, channel) };
   } catch (error) {
     relay.close();
     throw error;
@@ -179,6 +180,19 @@ function decodeBundle(encoded: string): PairingBundle {
 async function deviceIdentifier(signingPublicKey: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', owned(signingPublicKey)));
   return `device-${base64URL(digest.slice(0, 12))}`;
+}
+
+/**
+ * The device ID for this browser's local identity -- the same value
+ * {@link pairAndConnect} and {@link reconnectToMate} use, derived purely
+ * from the stored Ed25519 identity (so it's identical across every paired
+ * mate). Exposed for call sites that need it without an active
+ * {@link PairedConnection}, e.g. unsubscribing push notifications for a
+ * mate that's being forgotten.
+ */
+export async function currentDeviceId(): Promise<string> {
+  const identity = await loadOrCreateIdentity();
+  return deviceIdentifier(identity.signingPublicKey);
 }
 
 async function verifyRecord(record: DeviceRecord, bundle: PairingBundle): Promise<void> {
