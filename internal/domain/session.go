@@ -42,6 +42,13 @@ type TargetSpec struct {
 	Rows uint16            `json:"rows,omitempty"`
 }
 
+// Terminal reports whether the session's process has stopped running —
+// nothing further will change its output or exit code, so it is safe to
+// drop the session's bookkeeping entirely.
+func (s SessionState) Terminal() bool {
+	return s == StateFinished || s == StateError
+}
+
 func (s Session) PermissionFor(deviceID string) Permission {
 	if p, ok := s.DevicePerms[deviceID]; ok {
 		return p

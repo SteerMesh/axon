@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/relay"
+	"github.com/SteerMesh/axon/pkg/protocol"
 	"github.com/coder/websocket"
 )
 
@@ -28,10 +29,27 @@ func NewConnector(relayURL, token, mateID string, endpoint *Endpoint) *Connector
 	return &Connector{relayURL: relayURL, token: token, mateID: mateID, endpoint: endpoint}
 }
 
+// healthyConnectionWindow is how long a relay connection must stay up before
+// a subsequent failure is treated as a fresh problem rather than a
+// continuation of a prior outage, so backoff can reset to its floor instead
+// of staying stretched out from an earlier, unrelated run of failures.
+const healthyConnectionWindow = 10 * time.Second
+
+// resetsBackoff reports whether a connection that stayed up for connectedFor
+// counts as healthy enough to reset backoff to its floor on disconnect.
+func resetsBackoff(connectedFor time.Duration) bool {
+	return connectedFor >= healthyConnectionWindow
+}
+
 func (c *Connector) Run(ctx context.Context) error {
 	backoff := time.Second
 	for {
-		if err := c.runOnce(ctx); err != nil && ctx.Err() == nil {
+		connectedAt := time.Now()
+		err := c.runOnce(ctx)
+		if resetsBackoff(time.Since(connectedAt)) {
+			backoff = time.Second
+		}
+		if err != nil && ctx.Err() == nil {
 			slog.Warn("Axon relay connection ended", "error", err, "retry_in", backoff)
 		}
 		if ctx.Err() != nil {
@@ -75,6 +93,10 @@ func (c *Connector) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Match the relay's accepted-connection read limit (see hub.go) so a
+	// large frame the relay forwards to this Mate isn't killed by
+	// coder/websocket's much smaller 32768-byte default first.
+	conn.SetReadLimit(relay.MaxFrameBytes)
 	c.writeMu.Lock()
 	c.conn = conn
 	c.writeMu.Unlock()
@@ -97,24 +119,53 @@ func (c *Connector) runOnce(ctx context.Context) error {
 		if err := json.Unmarshal(data, &frame); err != nil || frame.From == "" {
 			continue
 		}
-		response, err := c.endpoint.Process(ctx, frame.From, frame.Payload)
+		outbound, err := c.endpoint.Handle(ctx, frame.From, frame.Payload)
 		if err != nil {
 			slog.Warn("Rejected remote frame", "device_id", frame.From, "error", err)
+			// A device waiting on this request must never hang indefinitely:
+			// always send back a reply, even when the Mate could not satisfy
+			// it, so the device's pending promise settles.
+			if sendErr := c.Send(ctx, frame.From, errorPacket(err)); sendErr != nil {
+				return sendErr
+			}
 			continue
 		}
-		if err := c.Send(ctx, frame.From, response); err != nil {
+		if outbound.Envelope != nil {
+			if err := c.sendEnvelope(ctx, frame.From, *outbound.Envelope); err != nil {
+				return err
+			}
+			if outbound.Subscription != nil {
+				c.endpoint.Activate(ctx, frame.From, outbound.Subscription, func(event protocol.Envelope) error {
+					return c.sendEnvelope(ctx, frame.From, event)
+				})
+			}
+		} else if err := c.Send(ctx, frame.From, outbound.Packet); err != nil {
 			return err
 		}
 	}
 }
 
 func (c *Connector) Send(ctx context.Context, deviceID string, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.sendLocked(ctx, deviceID, payload)
+}
+
+func (c *Connector) sendEnvelope(ctx context.Context, deviceID string, envelope protocol.Envelope) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	payload, err := c.endpoint.Encrypt(deviceID, envelope)
+	if err != nil {
+		return err
+	}
+	return c.sendLocked(ctx, deviceID, payload)
+}
+
+func (c *Connector) sendLocked(ctx context.Context, deviceID string, payload []byte) error {
 	frame, err := json.Marshal(relay.RouteFrame{Version: 1, MateID: c.mateID, From: "mate", To: deviceID, Payload: payload})
 	if err != nil {
 		return err
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	if c.conn == nil {
 		return fmt.Errorf("relay is not connected")
 	}

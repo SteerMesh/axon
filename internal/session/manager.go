@@ -20,9 +20,10 @@ const (
 )
 
 var (
-	ErrNotFound  = errors.New("session not found")
-	ErrReadOnly  = errors.New("session is read-only")
-	ErrDuplicate = errors.New("session name already exists")
+	ErrNotFound      = errors.New("session not found")
+	ErrReadOnly      = errors.New("session is read-only")
+	ErrDuplicate     = errors.New("session name already exists")
+	ErrSessionActive = errors.New("session is still active; close it first")
 )
 
 type Manager struct {
@@ -289,6 +290,31 @@ func (m *Manager) Signal(idOrName string, signal target.Signal) error {
 		return err
 	}
 	return rs.process.Signal(signal)
+}
+
+// Remove drops a session's bookkeeping (scrollback, name, metadata)
+// entirely. It refuses to remove a session that hasn't reached a terminal
+// state — Signal it to a stop first, otherwise the still-running process
+// would be orphaned with no way to reattach, replay its output, or signal
+// it again.
+func (m *Manager) Remove(idOrName string) error {
+	rs, err := m.Resolve(idOrName)
+	if err != nil {
+		return err
+	}
+	rs.mu.Lock()
+	if !rs.meta.State.Terminal() {
+		rs.mu.Unlock()
+		return ErrSessionActive
+	}
+	id, name := rs.meta.ID, rs.meta.Name
+	rs.mu.Unlock()
+
+	m.mu.Lock()
+	delete(m.sessions, id)
+	delete(m.names, name)
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) Replay(idOrName string, from uint64) (Replay, error) {

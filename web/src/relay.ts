@@ -1,5 +1,23 @@
 import type { NoiseChannel } from './crypto/noiseIK';
 
+/** Plaintext packet kind the Mate uses to report a rejected request. */
+const errorPacketKind = 5;
+
+/**
+ * Decodes a packetError frame's payload into a readable Error. The Mate
+ * sends this instead of silently dropping a request it could not satisfy
+ * (handshake required, decrypt failure, revoked device, rejected pairing, …)
+ * so a device never hangs waiting for a reply that will never arrive.
+ */
+export function mateRejection(payload: Uint8Array): Error {
+  try {
+    const detail = JSON.parse(new TextDecoder().decode(payload)) as { code?: string; message?: string };
+    return new Error(detail.message ?? detail.code ?? 'the mate rejected this request');
+  } catch {
+    return new Error('the mate rejected this request');
+  }
+}
+
 interface RouteFrame {
   v: 1;
   mate_id: string;
@@ -80,6 +98,7 @@ export class SecureTransport {
 
   async receive<T>(): Promise<T> {
     const framed = await this.#relay.receive();
+    if (framed[0] === errorPacketKind) throw mateRejection(framed.slice(1));
     if (framed[0] !== 3) throw new Error('relay sent an invalid encrypted transport packet');
     return JSON.parse(new TextDecoder().decode(this.#channel.decrypt(framed.slice(1)))) as T;
   }

@@ -173,6 +173,55 @@ func TestManagerLifecycleAndValidation(t *testing.T) {
 	t.Fatal("session did not finish")
 }
 
+func TestManagerRemoveRequiresTerminalState(t *testing.T) {
+	process := newFakeProcess()
+	manager := NewManager(1024, fakeAdapter{process: process})
+	created, err := manager.Create(context.Background(), "removable", domain.TargetSpec{Kind: "fake"}, domain.PermissionInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Remove(created.ID); err != ErrSessionActive {
+		t.Fatalf("removed a running session: err=%v", err)
+	}
+	if err := manager.Remove("missing"); err != ErrNotFound {
+		t.Fatalf("missing session error = %v", err)
+	}
+
+	close(process.done)
+	_ = process.outputW.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got, _ := manager.Get(created.ID); got.State == domain.StateFinished {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got, _ := manager.Get(created.ID); got.State != domain.StateFinished {
+		t.Fatal("session did not reach a terminal state")
+	}
+
+	if err := manager.Remove(created.ID); err != nil {
+		t.Fatalf("remove finished session: %v", err)
+	}
+	if _, err := manager.Get(created.ID); err != ErrNotFound {
+		t.Fatalf("removed session still resolvable by id: err=%v", err)
+	}
+	if _, err := manager.Get("removable"); err != ErrNotFound {
+		t.Fatalf("removed session still resolvable by name: err=%v", err)
+	}
+	for _, session := range manager.List() {
+		if session.ID == created.ID {
+			t.Fatal("removed session still appears in List")
+		}
+	}
+
+	// The freed name must be reusable.
+	if _, err := manager.Create(context.Background(), "removable", domain.TargetSpec{Kind: "fake"}, domain.PermissionInteractive); err != nil {
+		t.Fatalf("name was not freed after removal: %v", err)
+	}
+}
+
 type detectorFunc func([]byte) (target.StateObservation, bool)
 
 func (f detectorFunc) Detect(data []byte) (target.StateObservation, bool) { return f(data) }

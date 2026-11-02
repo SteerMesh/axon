@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/authz"
+	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/meshcli"
 	"github.com/SteerMesh/axon/internal/session"
 	"github.com/SteerMesh/axon/internal/store"
@@ -29,6 +30,15 @@ type Dispatcher struct {
 	mesh      meshcli.Options
 }
 
+type Subscription struct {
+	SessionID string
+	Epoch     string
+	Replay    session.Replay
+	Chunks    <-chan session.Chunk
+	State     func() domain.SessionState
+	Cancel    func()
+}
+
 func (d *Dispatcher) WithMeshOptions(options meshcli.Options) *Dispatcher {
 	d.mesh = options
 	return d
@@ -41,6 +51,73 @@ func (d *Dispatcher) WithTemplates(catalog templates.Catalog) *Dispatcher {
 
 func NewDispatcher(manager *session.Manager, persistent *store.Store) *Dispatcher {
 	return &Dispatcher{manager: manager, store: persistent}
+}
+
+// Subscribe atomically captures retained output and registers for future
+// chunks. It is separate from Handle because its live channel is an in-process
+// capability and must never be serialized into the wire response.
+func (d *Dispatcher) Subscribe(ctx context.Context, device DeviceContext, request protocol.Envelope) (protocol.Envelope, *Subscription) {
+	response := protocol.Envelope{
+		Version: protocol.Version, ID: ulid.Make().String(), ReplyTo: request.ID,
+		Type: request.Type + ".response", SessionID: request.SessionID, Timestamp: time.Now().UTC(),
+	}
+	var operationErr error
+	var params struct {
+		FromSeq uint64 `json:"from_seq"`
+	}
+	if operationErr = request.Validate(); operationErr == nil {
+		operationErr = json.Unmarshal(request.Data, &params)
+	}
+	if operationErr == nil {
+		operationErr = d.authorizeSession(device, request.SessionID, authz.OperationAttach, false)
+	}
+	var subscription *Subscription
+	if operationErr == nil {
+		managed, err := d.manager.Get(request.SessionID)
+		if err != nil {
+			operationErr = err
+		} else {
+			replay, chunks, cancel, err := d.manager.Subscribe(request.SessionID, params.FromSeq)
+			operationErr = err
+			if err == nil {
+				sessionID := managed.ID
+				subscription = &Subscription{
+					SessionID: managed.ID, Epoch: managed.StreamEpoch,
+					Replay: replay, Chunks: chunks, Cancel: cancel,
+					State: func() domain.SessionState {
+						current, getErr := d.manager.Get(sessionID)
+						if getErr != nil {
+							return domain.StateError
+						}
+						return current.State
+					},
+				}
+			}
+		}
+	}
+	outcome := "accepted"
+	if operationErr != nil {
+		outcome = errorCode(operationErr)
+	}
+	if d.store != nil {
+		_ = d.store.Audit(ctx, store.AuditEntry{
+			OccurredAt: time.Now(), DeviceID: device.ID, SessionID: request.SessionID,
+			Action: request.Type, Outcome: outcome,
+		}, nil)
+	}
+	if operationErr != nil {
+		return withError(response, outcome, operationErr.Error()), nil
+	}
+	data, err := json.Marshal(subscription.Replay)
+	if err != nil {
+		if subscription.Cancel != nil {
+			subscription.Cancel()
+		}
+		return withError(response, "internal", err.Error()), nil
+	}
+	response.Epoch = subscription.Epoch
+	response.Data = data
+	return response, subscription
 }
 
 func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request protocol.Envelope) protocol.Envelope {
@@ -101,6 +178,12 @@ func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request p
 			operationErr = d.manager.Signal(request.SessionID, params.Signal)
 		}
 		result = map[string]bool{"signaled": operationErr == nil}
+	case string(authz.OperationRemove):
+		operationErr = d.authorizeSession(device, request.SessionID, authz.OperationRemove, false)
+		if operationErr == nil {
+			operationErr = d.manager.Remove(request.SessionID)
+		}
+		result = map[string]bool{"removed": operationErr == nil}
 	case string(authz.OperationCreate):
 		var params struct {
 			Template  string `json:"template"`
@@ -194,6 +277,8 @@ func errorCode(err error) string {
 		return "confirmation_required"
 	case errors.Is(err, session.ErrNotFound):
 		return "not_found"
+	case errors.Is(err, session.ErrSessionActive):
+		return "session_active"
 	default:
 		return "invalid_message"
 	}

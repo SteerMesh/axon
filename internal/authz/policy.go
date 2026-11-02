@@ -22,6 +22,7 @@ const (
 	OperationResize Operation = "session.resize"
 	OperationSignal Operation = "session.signal"
 	OperationCreate Operation = "session.create"
+	OperationRemove Operation = "session.remove"
 )
 
 var (
