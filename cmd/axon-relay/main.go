@@ -16,12 +16,27 @@ func main() {
 	addr := envOr("AXON_RELAY_ADDR", ":8080")
 	token := os.Getenv("AXON_RELAY_TOKEN")
 	origins := splitNonEmpty(os.Getenv("AXON_RELAY_ORIGINS"))
+	vapidPublicKey := os.Getenv("AXON_RELAY_VAPID_PUBLIC_KEY")
+	vapidPrivateKey := os.Getenv("AXON_RELAY_VAPID_PRIVATE_KEY")
 	if token == "" {
 		fmt.Fprintln(os.Stderr, "AXON_RELAY_TOKEN is required")
 		os.Exit(1)
 	}
+	hub := relay.NewHub(token, origins...)
+	switch {
+	case vapidPublicKey != "" && vapidPrivateKey != "":
+		subscriptions, err := relay.OpenSubscriptionStore(envOr("AXON_RELAY_DB_PATH", "axon-relay.db"))
+		if err != nil {
+			slog.Error("Axon Relay failed to open push subscription store", "error", err)
+			os.Exit(1)
+		}
+		defer subscriptions.Close()
+		hub.EnablePush(subscriptions, vapidPublicKey, vapidPrivateKey)
+	case vapidPublicKey != "" || vapidPrivateKey != "":
+		slog.Warn("AXON_RELAY_VAPID_PUBLIC_KEY and AXON_RELAY_VAPID_PRIVATE_KEY must both be set; push notifications disabled")
+	}
 	server := &http.Server{
-		Addr: addr, Handler: relay.NewHub(token, origins...),
+		Addr: addr, Handler: hub,
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 70 * time.Second,
 	}
 	slog.Info("Axon Relay listening", "address", addr)

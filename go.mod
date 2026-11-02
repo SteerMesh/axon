@@ -5,13 +5,14 @@ go 1.26.0
 toolchain go1.27.3
 
 require (
+	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/coder/websocket v1.8.14
 	github.com/creack/pty v1.1.24
 	github.com/flynn/noise v1.1.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/oklog/ulid/v2 v2.1.2
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
+	golang.org/x/crypto v0.31.0
 	golang.org/x/term v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.61.0
@@ -20,6 +21,7 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

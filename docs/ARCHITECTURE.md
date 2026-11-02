@@ -20,6 +20,14 @@ protocol, processes, storage, and release lifecycle.
 1. The relay never receives session plaintext or session traffic keys.
 1. A revoked device cannot establish a new encrypted channel.
 
+The relay is content-blind, not state-blind: it never sees plaintext or
+traffic keys, but it does hold routing state (which mate and device peers
+are currently connected) and, as of Web Push support, notification metadata
+(which device endpoints are subscribed to be woken). Both are addressing
+information the relay needs to do its job, not session content. The
+`push_subscriptions` table is an instance of this: it stores where to send a
+wake notification, never why one was sent.
+
 ## Repository layout
 
 ```text
@@ -28,7 +36,7 @@ internal/domain/   Sessions, permissions, and state
 internal/session/  PTY lifecycle and replay
 internal/target/   Target adapters
 internal/ipc/      Local request/response and event streaming
-internal/relay/    Content-blind routing
+internal/relay/    Content-blind routing and wake notifications
 internal/security/ Pairing and Noise channels
 internal/store/    SQLite metadata and audit records
 pkg/protocol/      Public, versioned wire contracts

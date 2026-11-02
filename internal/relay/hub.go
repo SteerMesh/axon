@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,10 +14,20 @@ import (
 	"sync"
 	"time"
 
+	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/coder/websocket"
 )
 
 const MaxFrameBytes = 128 << 10
+
+// vapidSubscriber is the "aud"/"sub" contact embedded in the VAPID JWT, as
+// required by RFC 8292. It identifies the relay operator to push services,
+// not any end user.
+const vapidSubscriber = "mailto:axon-relay@steermesh.dev"
+
+// pushSender matches webpush.SendNotificationWithContext so tests can
+// substitute a mock without making real network calls.
+type pushSender func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error)
 
 type RouteFrame struct {
 	Version int    `json:"v"`
@@ -32,6 +43,17 @@ type Hub struct {
 	mates   map[string]*peer
 	devices map[string]map[string]*peer
 	origins []string
+	push    *pushConfig
+}
+
+// pushConfig holds everything needed to wake a backgrounded device over Web
+// Push. It is nil until EnablePush is called, which keeps the relay fully
+// functional (just without wake notifications) when VAPID keys aren't set.
+type pushConfig struct {
+	store      *SubscriptionStore
+	publicKey  string
+	privateKey string
+	send       pushSender
 }
 
 type peer struct {
@@ -46,10 +68,27 @@ func NewHub(token string, origins ...string) *Hub {
 	return &Hub{token: token, mates: make(map[string]*peer), devices: make(map[string]map[string]*peer), origins: origins}
 }
 
+// EnablePush turns on Web Push wake notifications. Until this is called the
+// relay behaves exactly as before: a frame with no connected target peer is
+// silently dropped.
+func (h *Hub) EnablePush(store *SubscriptionStore, publicKey, privateKey string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.push = &pushConfig{store: store, publicKey: publicKey, privateKey: privateKey, send: webpush.SendNotificationWithContext}
+}
+
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+	if r.URL.Path == "/v1/vapid-key" {
+		h.handleVAPIDKey(w, r)
+		return
+	}
+	if r.URL.Path == "/v1/push/subscribe" {
+		h.handlePushSubscribe(w, r)
 		return
 	}
 	if r.URL.Path != "/v1/connect" {
@@ -84,6 +123,92 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.unregister(p)
 	defer conn.CloseNow()
 	h.readLoop(r.Context(), p)
+}
+
+// pushSubscribeRequest mirrors the PushSubscription JSON shape the browser
+// produces from PushManager.subscribe(), plus the routing identity needed to
+// address it later.
+type pushSubscribeRequest struct {
+	MateID   string `json:"mate_id"`
+	DeviceID string `json:"device_id"`
+	Endpoint string `json:"endpoint"`
+	Keys     struct {
+		P256dh string `json:"p256dh"`
+		Auth   string `json:"auth"`
+	} `json:"keys"`
+}
+
+// handleVAPIDKey serves the relay's public VAPID key. It is intentionally
+// unauthenticated: the key is public by definition, and serving it over HTTP
+// (rather than baking it into the PWA build) lets the relay rotate it.
+func (h *Hub) handleVAPIDKey(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	publicKey := ""
+	if h.push != nil {
+		publicKey = h.push.publicKey
+	}
+	h.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"publicKey": publicKey})
+}
+
+func (h *Hub) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	h.mu.RLock()
+	push := h.push
+	h.mu.RUnlock()
+	if push == nil {
+		http.Error(w, "push notifications are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var req pushSubscribeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.MateID == "" || req.DeviceID == "" || req.Endpoint == "" || req.Keys.P256dh == "" || req.Keys.Auth == "" {
+			http.Error(w, "mate_id, device_id, endpoint, and keys are required", http.StatusBadRequest)
+			return
+		}
+		sub := Subscription{
+			MateID: req.MateID, DeviceID: req.DeviceID, Endpoint: req.Endpoint,
+			P256dh: req.Keys.P256dh, Auth: req.Keys.Auth, CreatedAt: time.Now().UTC(),
+		}
+		if err := push.store.Upsert(r.Context(), sub); err != nil {
+			http.Error(w, "store subscription: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		mateID, deviceID := r.URL.Query().Get("mate_id"), r.URL.Query().Get("device_id")
+		if mateID == "" || deviceID == "" {
+			var req pushSubscribeRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+				if mateID == "" {
+					mateID = req.MateID
+				}
+				if deviceID == "" {
+					deviceID = req.DeviceID
+				}
+			}
+		}
+		if mateID == "" || deviceID == "" {
+			http.Error(w, "mate_id and device_id are required", http.StatusBadRequest)
+			return
+		}
+		if err := push.store.Delete(r.Context(), mateID, deviceID); err != nil {
+			http.Error(w, "delete subscription: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (h *Hub) authorized(r *http.Request) bool {
@@ -193,6 +318,7 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 				_ = source.conn.Close(websocket.StatusTryAgainLater, "mate unavailable")
 				return
 			}
+			h.triggerPush(frame)
 			continue
 		}
 		forwarded, _ := json.Marshal(frame)
@@ -223,6 +349,64 @@ func (h *Hub) target(frame RouteFrame) *peer {
 		return h.mates[frame.MateID]
 	}
 	return h.devices[frame.MateID][frame.To]
+}
+
+// triggerPush fires a content-free Web Push wake notification when a frame
+// could not be delivered to a connected device peer. It is called from the
+// exact point that already detects "no connected peer for this device" with
+// zero content awareness, so it adds no new information flow: the relay
+// still never learns anything about the frame beyond its routing identity.
+// Mate targets never have a push subscription (the host agent isn't a
+// browser), so only device targets are considered.
+func (h *Hub) triggerPush(frame RouteFrame) {
+	if frame.To == "" || frame.To == "mate" {
+		return
+	}
+	h.mu.RLock()
+	push := h.push
+	h.mu.RUnlock()
+	if push == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		push.notify(ctx, frame.MateID, frame.To)
+	}()
+}
+
+// notify looks up the subscription for (mateID, deviceID) and, if present,
+// sends a wake notification. The push payload is fixed and content-free: it
+// never carries sid, data, or anything content-derived. A 404/410 response
+// means the push service considers the subscription dead, so it is removed.
+func (p *pushConfig) notify(ctx context.Context, mateID, deviceID string) {
+	sub, err := p.store.Get(ctx, mateID, deviceID)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			slog.Warn("Axon Relay failed to look up push subscription", "error", err)
+		}
+		return
+	}
+	payload := []byte(`{"type":"wake"}`)
+	resp, err := p.send(ctx, payload, &webpush.Subscription{
+		Endpoint: sub.Endpoint,
+		Keys:     webpush.Keys{P256dh: sub.P256dh, Auth: sub.Auth},
+	}, &webpush.Options{
+		Subscriber:      vapidSubscriber,
+		VAPIDPublicKey:  p.publicKey,
+		VAPIDPrivateKey: p.privateKey,
+		TTL:             60,
+	})
+	if err != nil {
+		slog.Warn("Axon Relay failed to send push notification", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		if err := p.store.Delete(ctx, mateID, deviceID); err != nil {
+			slog.Warn("Axon Relay failed to delete dead push subscription", "error", err)
+		}
+	}
 }
 
 func (h *Hub) MateConnected(mateID string) bool {
