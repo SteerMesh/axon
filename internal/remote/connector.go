@@ -11,22 +11,23 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/relay"
+	"github.com/SteerMesh/axon/internal/security"
 	"github.com/SteerMesh/axon/pkg/protocol"
 	"github.com/coder/websocket"
 )
 
 type Connector struct {
 	relayURL string
-	token    string
 	mateID   string
+	identity security.Identity
 	endpoint *Endpoint
 
 	writeMu sync.Mutex
 	conn    *websocket.Conn
 }
 
-func NewConnector(relayURL, token, mateID string, endpoint *Endpoint) *Connector {
-	return &Connector{relayURL: relayURL, token: token, mateID: mateID, endpoint: endpoint}
+func NewConnector(relayURL, mateID string, identity security.Identity, endpoint *Endpoint) *Connector {
+	return &Connector{relayURL: relayURL, mateID: mateID, identity: identity, endpoint: endpoint}
 }
 
 // healthyConnectionWindow is how long a relay connection must stay up before
@@ -87,8 +88,15 @@ func (c *Connector) runOnce(ctx context.Context) error {
 	query.Set("mate_id", c.mateID)
 	query.Set("role", "mate")
 	endpointURL.RawQuery = query.Encode()
+	// Minted fresh for every dial attempt: the mate holds its own signing
+	// key locally, so there's nothing to cache or renew -- unlike a
+	// device, it never needs to ask anyone else for relay access.
+	token, _, err := security.MintRelayToken(c.identity, c.mateID, security.RelayScopeMate, "", security.MateRelayTokenTTL)
+	if err != nil {
+		return err
+	}
 	header := make(http.Header)
-	header.Set("Authorization", "Bearer "+c.token)
+	header.Set("Authorization", "Bearer "+token)
 	conn, _, err := websocket.Dial(ctx, endpointURL.String(), &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
 	if err != nil {
 		return err

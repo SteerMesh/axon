@@ -274,17 +274,17 @@ func (e *Endpoint) completePairing(ctx context.Context, payload []byte) ([]byte,
 	if err := json.Unmarshal(payload, &request); err != nil {
 		return nil, err
 	}
-	record, err := e.pairing.Complete(request.Token, request.Presentation)
+	result, err := e.pairing.Complete(request.Token, request.Presentation)
 	if err != nil {
 		return nil, err
 	}
-	if err := e.store.PutDevice(ctx, record, authz.RoleOwner); err != nil {
+	if err := e.store.PutDevice(ctx, result.Record, authz.RoleOwner); err != nil {
 		return nil, err
 	}
 	// A browser may pair the same device again after a reload or interrupted
 	// transport. Its new Noise handshake must replace the old channel state.
-	e.drop(record.DeviceID)
-	encoded, err := json.Marshal(record)
+	e.drop(result.Record.DeviceID)
+	encoded, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
 	}

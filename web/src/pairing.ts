@@ -1,8 +1,9 @@
 import { NoiseIKInitiator } from './crypto/noiseIK';
 import { loadOrCreateIdentity } from './identityStore';
-import { type PairedMate, saveMate, touchLastConnected } from './mateStore';
+import { type PairedMate, saveMate, touchLastConnected, updateRelayToken } from './mateStore';
 import { base64, base64URL, fromBase64, mateRejection, RelayTransport, SecureTransport } from './relay';
 import { withTimeout } from './timeout';
+import type { AxonClient } from './client';
 
 /** How long pairing and the Noise handshake may each wait for a relay reply. */
 const PAIRING_STEP_TIMEOUT_MS = 15_000;
@@ -13,6 +14,15 @@ interface PairingBundle {
   mate_noise_key: string;
   relay_url: string;
   one_time_token: string;
+  /**
+   * A pairing-scope Relay Access Token (see internal/security/relaytoken.go
+   * on the mate). This replaces the old out-of-band relay ticket an
+   * operator used to hand-type into the pairing form: the QR bundle now
+   * carries everything this device needs to open its first relay
+   * connection. It is wildcarded to any device_id, since the real
+   * device_id isn't known until the device presents itself below.
+   */
+  relay_token: string;
   expires_at: string;
 }
 
@@ -25,14 +35,28 @@ interface DeviceRecord {
   mate_signature: string;
 }
 
+/** The mate's reply to a completed pairing exchange (security.PairingResult). */
+interface PairingReply {
+  record: DeviceRecord;
+  relay_token: string;
+  relay_token_expires_at: number;
+}
+
 export interface PairedConnection {
   deviceId: string;
   mateId: string;
   relayUrl: string;
+  /**
+   * The device-scope Relay Access Token this connection authenticated
+   * with. Callers that need to authorize a REST call against the same
+   * relay (e.g. push.ts's subscribe/unsubscribe) reuse this instead of
+   * asking for a separately typed ticket.
+   */
+  relayToken: string;
   transport: SecureTransport;
 }
 
-export async function pairAndConnect(encodedBundle: string, relayTicket: string): Promise<PairedConnection> {
+export async function pairAndConnect(encodedBundle: string): Promise<PairedConnection> {
   const bundle = decodeBundle(encodedBundle);
   if (Date.parse(bundle.expires_at) <= Date.now()) throw new Error('pairing code has expired');
   const identity = await loadOrCreateIdentity();
@@ -54,7 +78,7 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
     owned(new TextEncoder().encode(signedMessage)),
   ));
 
-  const relay = new RelayTransport(bundle.relay_url, bundle.mate_id, deviceId, relayTicket);
+  const relay = new RelayTransport(bundle.relay_url, bundle.mate_id, deviceId, bundle.relay_token);
   await relay.opened();
   try {
     const pairingRequest = new TextEncoder().encode(JSON.stringify({
@@ -65,8 +89,8 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
     const pairingReply = await withTimeout(relay.receive(), PAIRING_STEP_TIMEOUT_MS, 'pairing timed out waiting for the mate');
     if (pairingReply[0] === 5) throw mateRejection(pairingReply.slice(1));
     if (pairingReply[0] !== 4) throw new Error('Mate rejected pairing');
-    const record = JSON.parse(new TextDecoder().decode(pairingReply.slice(1))) as DeviceRecord;
-    await verifyRecord(record, bundle);
+    const reply = JSON.parse(new TextDecoder().decode(pairingReply.slice(1))) as PairingReply;
+    await verifyRecord(reply.record, bundle);
 
     const prologue = new TextEncoder().encode(`mesh-axon-v1:${bundle.mate_id}:${deviceId}`);
     const initiator = new NoiseIKInitiator(identity.noiseKeyPair, fromBase64(bundle.mate_noise_key), prologue);
@@ -76,21 +100,26 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
     if (handshakeReply[0] !== 2) throw new Error('Mate rejected the encrypted channel');
     const { channel } = await initiator.finish(handshakeReply.slice(1));
     try {
-      // Remember this mate so the device can reconnect later without
-      // re-scanning the QR code. Losing this is a worse UX, not a failed
-      // pairing — don't let a storage problem undo a connection that
-      // otherwise succeeded.
+      // Remember this mate (and the device-scope relay token it just
+      // minted) so the device can reconnect later without re-scanning the
+      // QR code. Losing this is a worse UX, not a failed pairing — don't
+      // let a storage problem undo a connection that otherwise succeeded.
       await saveMate({
         mateId: bundle.mate_id,
         noisePublicKey: fromBase64(bundle.mate_noise_key),
         signingPublicKey: fromBase64(bundle.mate_signing_key),
         relayUrl: bundle.relay_url,
         lastConnectedAt: Date.now(),
+        relayToken: reply.relay_token,
+        relayTokenExpiresAt: reply.relay_token_expires_at * 1000,
       });
     } catch {
       // ignored — see comment above
     }
-    return { deviceId, mateId: bundle.mate_id, relayUrl: bundle.relay_url, transport: new SecureTransport(relay, channel) };
+    return {
+      deviceId, mateId: bundle.mate_id, relayUrl: bundle.relay_url,
+      relayToken: reply.relay_token, transport: new SecureTransport(relay, channel),
+    };
   } catch (error) {
     // A failed or timed-out pairing attempt must not leave a stale device
     // socket registered on the relay — that blocks every retry until the
@@ -98,6 +127,25 @@ export async function pairAndConnect(encodedBundle: string, relayTicket: string)
     // point).
     relay.close();
     throw error;
+  }
+}
+
+/**
+ * Thrown by {@link reconnectToMate} when the stored device-scope relay
+ * token has already expired. Distinct from a network/crypto failure (see
+ * {@link MateKeyMismatchError}) so the UI can specifically prompt
+ * re-pairing instead of showing a raw connection error -- there is no way
+ * to renew an expired token without a live connection to renew it over
+ * (see refreshRelayToken), so once expired the only path back is
+ * re-pairing.
+ */
+export class RelayTokenExpiredError extends Error {
+  readonly mateId: string;
+
+  constructor(mateId: string) {
+    super(`"${mateId}"'s relay access has expired — re-pair this device to continue.`);
+    this.name = 'RelayTokenExpiredError';
+    this.mateId = mateId;
   }
 }
 
@@ -119,22 +167,22 @@ export class MateKeyMismatchError extends Error {
 }
 
 /**
- * Reconnects to a previously paired mate using its stored keys and relay
- * URL — skipping the QR scan and signed DeviceRecord exchange that
- * {@link pairAndConnect} performs, since the device and mate already trust
- * each other's long-term keys. Only a fresh Noise IK handshake is needed.
+ * Reconnects to a previously paired mate using its stored keys, relay URL,
+ * and device-scope relay token — skipping the QR scan and signed
+ * DeviceRecord exchange that {@link pairAndConnect} performs, since the
+ * device and mate already trust each other's long-term keys. Only a
+ * fresh Noise IK handshake is needed.
  *
- * `relayTicket` is the same relay access ticket used during pairing. The
- * relay (see `internal/relay/hub.go`) checks it as a static shared secret,
- * not a one-time token, so it is safe to reuse across reconnects — it is
- * intentionally not persisted in {@link PairedMate}, so the caller must
- * supply it again (e.g. by prompting the user).
+ * Throws {@link RelayTokenExpiredError} up front if the stored token has
+ * already expired, rather than attempting (and failing) to open the relay
+ * connection with a token the relay will reject.
  */
-export async function reconnectToMate(mate: PairedMate, relayTicket: string): Promise<PairedConnection> {
+export async function reconnectToMate(mate: PairedMate): Promise<PairedConnection> {
+  if (mate.relayTokenExpiresAt <= Date.now()) throw new RelayTokenExpiredError(mate.mateId);
   const identity = await loadOrCreateIdentity();
   const deviceId = await deviceIdentifier(identity.signingPublicKey);
 
-  const relay = new RelayTransport(mate.relayUrl, mate.mateId, deviceId, relayTicket);
+  const relay = new RelayTransport(mate.relayUrl, mate.mateId, deviceId, mate.relayToken);
   await relay.opened();
   try {
     const prologue = new TextEncoder().encode(`mesh-axon-v1:${mate.mateId}:${deviceId}`);
@@ -164,11 +212,29 @@ export async function reconnectToMate(mate: PairedMate, relayTicket: string): Pr
     } catch {
       // ignored — see comment above
     }
-    return { deviceId, mateId: mate.mateId, relayUrl: mate.relayUrl, transport: new SecureTransport(relay, channel) };
+    return {
+      deviceId, mateId: mate.mateId, relayUrl: mate.relayUrl,
+      relayToken: mate.relayToken, transport: new SecureTransport(relay, channel),
+    };
   } catch (error) {
     relay.close();
     throw error;
   }
+}
+
+/**
+ * Re-mints the device-scope relay token over an already-open, paired
+ * connection — mirroring what the mate's PairingManager.Complete does at
+ * pairing time (see dispatcher.go's "relay.token.refresh" case) — and
+ * persists the result so a later reload can still reconnect without
+ * re-pairing. Call this proactively (see main.ts) before the current
+ * token's expiry, not after: once a token has actually expired there is
+ * no live connection left to refresh it over.
+ */
+export async function refreshRelayToken(client: Pick<AxonClient, 'request'>, mateId: string): Promise<void> {
+  const response = await client.request<{ relay_token: string; relay_token_expires_at: number }>('relay.token.refresh');
+  if (!response.data) throw new Error('relay token refresh returned no data');
+  await updateRelayToken(mateId, response.data.relay_token, response.data.relay_token_expires_at * 1000);
 }
 
 function decodeBundle(encoded: string): PairingBundle {

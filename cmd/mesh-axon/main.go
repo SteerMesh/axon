@@ -61,7 +61,7 @@ func newRoot(defaultSocket string) *cobra.Command {
 
 func newServeCommand() *cobra.Command {
 	var sshHosts, dockerContainers []string
-	var relayURL, relayToken, mateID, dataDir string
+	var relayURL, mateID, dataDir string
 	command := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the Axon Agent",
@@ -101,18 +101,22 @@ func newServeCommand() *cobra.Command {
 			manager.RegisterDetector("claude", detector.NewPromptHeuristic("claude.prompt", `allow this action`, `do you want to proceed`, `waiting for input`))
 			manager.RegisterDetector("kiro-cli", detector.NewPromptHeuristic("kiro.prompt", `allow this action`, `do you want to proceed`, `waiting for input`))
 			pairing := security.NewPairingManager(mateID, relayURL, identity)
-			server, err := ipc.ListenWithOptions(manager, socketPath, ipc.Options{Pairing: pairing, Store: persistent})
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			dispatcher := remote.NewDispatcher(manager, persistent).WithIdentity(mateID, identity)
+			// Built unconditionally (not just when relayURL is set) so that
+			// devices.revoke can drop a device's live channel below even
+			// when no relay happens to be configured right now.
+			endpoint := remote.NewEndpoint(mateID, identity, persistent, dispatcher).WithPairing(pairing)
+
+			server, err := ipc.ListenWithOptions(manager, socketPath, ipc.Options{Pairing: pairing, Store: persistent, Revoker: endpoint})
 			if err != nil {
 				return err
 			}
 			defer server.Close()
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
+
 			if relayURL != "" {
-				if relayToken == "" {
-					return fmt.Errorf("--relay-token or AXON_RELAY_TOKEN is required with --relay-url")
-				}
-				dispatcher := remote.NewDispatcher(manager, persistent)
 				meshOptions, optionsErr := meshcli.Discover(ctx, "mesh")
 				if optionsErr != nil {
 					fmt.Fprintf(os.Stderr, "warning: %v\n", optionsErr)
@@ -130,8 +134,10 @@ func newServeCommand() *cobra.Command {
 					return statErr
 				}
 				dispatcher.WithTemplates(catalog)
-				endpoint := remote.NewEndpoint(mateID, identity, persistent, dispatcher).WithPairing(pairing)
-				connector := remote.NewConnector(relayURL, relayToken, mateID, endpoint)
+				// The mate no longer needs an externally-provisioned relay
+				// secret: it mints its own mate-scope Relay Access Token
+				// from its identity key on every dial (see connector.go).
+				connector := remote.NewConnector(relayURL, mateID, identity, endpoint)
 				go func() {
 					_ = connector.Run(ctx)
 				}()
@@ -144,7 +150,6 @@ func newServeCommand() *cobra.Command {
 	command.Flags().StringSliceVar(&sshHosts, "ssh-host", nil, "Allowed SSH host (repeatable)")
 	command.Flags().StringSliceVar(&dockerContainers, "docker-container", nil, "Allowed Docker container (repeatable)")
 	command.Flags().StringVar(&relayURL, "relay-url", os.Getenv("AXON_RELAY_URL"), "Axon Relay URL")
-	command.Flags().StringVar(&relayToken, "relay-token", os.Getenv("AXON_RELAY_TOKEN"), "Axon Relay access token")
 	command.Flags().StringVar(&mateID, "mate-id", "", "Stable host identity (derived from the signing key by default)")
 	command.Flags().StringVar(&dataDir, "data-dir", "", "Agent state directory (default ~/.mesh/axon)")
 	return command

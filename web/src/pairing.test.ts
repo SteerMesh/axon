@@ -82,11 +82,14 @@ vi.mock('./crypto/noiseIK', async (importOriginal) => {
 vi.mock('./mateStore', () => ({
   saveMate: vi.fn(async () => undefined),
   touchLastConnected: vi.fn(async () => undefined),
+  updateRelayToken: vi.fn(async () => undefined),
 }));
 
 // Imported after the mocks above so pairing.ts picks up the mocked modules.
-const { MateKeyMismatchError, pairAndConnect, reconnectToMate } = await import('./pairing');
-const { saveMate, touchLastConnected } = await import('./mateStore');
+const {
+  MateKeyMismatchError, RelayTokenExpiredError, pairAndConnect, reconnectToMate, refreshRelayToken,
+} = await import('./pairing');
+const { saveMate, touchLastConnected, updateRelayToken } = await import('./mateStore');
 const { loadOrCreateIdentity } = await import('./identityStore');
 
 function toBase64(bytes: Uint8Array): string {
@@ -112,6 +115,8 @@ function samplePairedMate(overrides: Partial<Parameters<typeof reconnectToMate>[
     signingPublicKey: new Uint8Array(32).fill(4),
     relayUrl: 'wss://relay.example/v1',
     lastConnectedAt: 1_700_000_000_000,
+    relayToken: 'device-relay-token',
+    relayTokenExpiresAt: Date.now() + 60_000,
     ...overrides,
   };
 }
@@ -123,7 +128,7 @@ beforeEach(() => {
 });
 
 describe('pairAndConnect', () => {
-  it('persists the mate keys and relay URL after a successful pairing', async () => {
+  it('reads the relay token from the bundle, and persists the device-scope token from the reply', async () => {
     const mateSigningKeyPair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as CryptoKeyPair;
     const mateSigningPublicKey = new Uint8Array(await crypto.subtle.exportKey('raw', mateSigningKeyPair.publicKey));
     const bundle = {
@@ -132,13 +137,17 @@ describe('pairAndConnect', () => {
       mate_noise_key: toBase64(new Uint8Array(32).fill(5)),
       relay_url: 'wss://relay.example/v1',
       one_time_token: 'one-time-token',
+      relay_token: 'pairing-relay-token',
       expires_at: new Date(Date.now() + 60_000).toISOString(),
     };
 
     const identity = await loadOrCreateIdentity();
-    const pairingDone = pairAndConnect(encodeBundle(bundle), 'relay-ticket-1');
+    const pairingDone = pairAndConnect(encodeBundle(bundle));
     await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
     const relay = FakeRelayTransport.instances[0]!;
+    // The relay transport must open with the bundle's relay token -- there
+    // is no manually supplied ticket parameter anymore.
+    expect(relay.ticket).toBe('pairing-relay-token');
 
     const record = {
       mate_id: bundle.mate_id,
@@ -151,16 +160,25 @@ describe('pairAndConnect', () => {
     const signature = new Uint8Array(
       await crypto.subtle.sign('Ed25519', mateSigningKeyPair.privateKey, new TextEncoder().encode(binding)),
     );
-    relay.queueReply(packet(4, new TextEncoder().encode(JSON.stringify({ ...record, mate_signature: toBase64(signature) }))));
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 86_400;
+    const pairingReply = {
+      record: { ...record, mate_signature: toBase64(signature) },
+      relay_token: 'device-relay-token',
+      relay_token_expires_at: expiresAtSeconds,
+    };
+    relay.queueReply(packet(4, new TextEncoder().encode(JSON.stringify(pairingReply))));
     relay.queueReply(packet(2, new Uint8Array(48)));
 
-    await pairingDone;
+    const connection = await pairingDone;
 
+    expect(connection.relayToken).toBe('device-relay-token');
     expect(saveMate).toHaveBeenCalledWith(expect.objectContaining({
       mateId: 'mate-1',
       relayUrl: bundle.relay_url,
       noisePublicKey: fromBase64Equivalent(bundle.mate_noise_key),
       signingPublicKey: mateSigningPublicKey,
+      relayToken: 'device-relay-token',
+      relayTokenExpiresAt: expiresAtSeconds * 1000,
     }));
     expect(relay.closed).toBe(false);
   });
@@ -175,11 +193,12 @@ describe('pairAndConnect', () => {
       mate_noise_key: toBase64(new Uint8Array(32).fill(6)),
       relay_url: 'wss://relay.example/v1',
       one_time_token: 'one-time-token',
+      relay_token: 'pairing-relay-token',
       expires_at: new Date(Date.now() + 60_000).toISOString(),
     };
 
     const identity = await loadOrCreateIdentity();
-    const pairingDone = pairAndConnect(encodeBundle(bundle), 'relay-ticket-1');
+    const pairingDone = pairAndConnect(encodeBundle(bundle));
     await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
     const relay = FakeRelayTransport.instances[0]!;
 
@@ -194,18 +213,79 @@ describe('pairAndConnect', () => {
     const signature = new Uint8Array(
       await crypto.subtle.sign('Ed25519', mateSigningKeyPair.privateKey, new TextEncoder().encode(binding)),
     );
-    relay.queueReply(packet(4, new TextEncoder().encode(JSON.stringify({ ...record, mate_signature: toBase64(signature) }))));
+    const pairingReply = {
+      record: { ...record, mate_signature: toBase64(signature) },
+      relay_token: 'device-relay-token',
+      relay_token_expires_at: Math.floor(Date.now() / 1000) + 86_400,
+    };
+    relay.queueReply(packet(4, new TextEncoder().encode(JSON.stringify(pairingReply))));
     relay.queueReply(packet(2, new Uint8Array(48)));
 
     await expect(pairingDone).resolves.toMatchObject({ mateId: 'mate-2' });
   });
+
+  it('rejects a pairing reply with an invalid mate signature', async () => {
+    const mateSigningKeyPair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as CryptoKeyPair;
+    const otherKeyPair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as CryptoKeyPair;
+    const mateSigningPublicKey = new Uint8Array(await crypto.subtle.exportKey('raw', mateSigningKeyPair.publicKey));
+    const bundle = {
+      mate_id: 'mate-3',
+      mate_signing_key: toBase64(mateSigningPublicKey),
+      mate_noise_key: toBase64(new Uint8Array(32).fill(7)),
+      relay_url: 'wss://relay.example/v1',
+      one_time_token: 'one-time-token',
+      relay_token: 'pairing-relay-token',
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    };
+
+    const identity = await loadOrCreateIdentity();
+    const pairingDone = pairAndConnect(encodeBundle(bundle));
+    await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
+    const relay = FakeRelayTransport.instances[0]!;
+
+    const record = {
+      mate_id: bundle.mate_id,
+      device_id: relay.deviceId,
+      device_signing_key: toBase64(identity.signingPublicKey),
+      device_noise_key: toBase64(identity.noisePublicKey),
+      paired_at: new Date().toISOString(),
+    };
+    const binding = JSON.stringify({ domain: 'mesh-axon-pairing-v1', ...record });
+    // Signed with a key that does NOT match bundle.mate_signing_key.
+    const badSignature = new Uint8Array(
+      await crypto.subtle.sign('Ed25519', otherKeyPair.privateKey, new TextEncoder().encode(binding)),
+    );
+    const pairingReply = {
+      record: { ...record, mate_signature: toBase64(badSignature) },
+      relay_token: 'device-relay-token',
+      relay_token_expires_at: Math.floor(Date.now() / 1000) + 86_400,
+    };
+    relay.queueReply(packet(4, new TextEncoder().encode(JSON.stringify(pairingReply))));
+
+    await expect(pairingDone).rejects.toThrow('invalid');
+  });
+
+  it('rejects an expired pairing bundle before touching the relay', async () => {
+    const bundle = {
+      mate_id: 'mate-4',
+      mate_signing_key: toBase64(new Uint8Array(32)),
+      mate_noise_key: toBase64(new Uint8Array(32)),
+      relay_url: 'wss://relay.example/v1',
+      one_time_token: 'one-time-token',
+      relay_token: 'pairing-relay-token',
+      expires_at: new Date(Date.now() - 1000).toISOString(),
+    };
+
+    await expect(pairAndConnect(encodeBundle(bundle))).rejects.toThrow('expired');
+    expect(FakeRelayTransport.instances).toHaveLength(0);
+  });
 });
 
 describe('reconnectToMate', () => {
-  it('opens a fresh Noise handshake against the stored keys and touches lastConnectedAt', async () => {
+  it('opens a fresh Noise handshake using the stored relay token and touches lastConnectedAt', async () => {
     const mate = samplePairedMate();
 
-    const reconnectDone = reconnectToMate(mate, 'relay-ticket-1');
+    const reconnectDone = reconnectToMate(mate);
     await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
     const relay = FakeRelayTransport.instances[0]!;
     relay.queueReply(packet(2, new Uint8Array(48)));
@@ -213,15 +293,25 @@ describe('reconnectToMate', () => {
     const connection = await reconnectDone;
 
     expect(connection.mateId).toBe(mate.mateId);
+    expect(connection.relayToken).toBe(mate.relayToken);
     expect(relay.relayUrl).toBe(mate.relayUrl);
+    // No manually supplied ticket -- the stored device-scope token is used.
+    expect(relay.ticket).toBe(mate.relayToken);
     expect(touchLastConnected).toHaveBeenCalledWith(mate.mateId);
+  });
+
+  it('surfaces a clear error when the stored relay token has already expired, without touching the relay', async () => {
+    const mate = samplePairedMate({ relayTokenExpiresAt: Date.now() - 1000 });
+
+    await expect(reconnectToMate(mate)).rejects.toBeInstanceOf(RelayTokenExpiredError);
+    expect(FakeRelayTransport.instances).toHaveLength(0);
   });
 
   it('still returns a working connection even if touchLastConnected fails', async () => {
     vi.mocked(touchLastConnected).mockRejectedValueOnce(new Error('indexeddb unavailable'));
     const mate = samplePairedMate();
 
-    const reconnectDone = reconnectToMate(mate, 'relay-ticket-1');
+    const reconnectDone = reconnectToMate(mate);
     await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
     const relay = FakeRelayTransport.instances[0]!;
     relay.queueReply(packet(2, new Uint8Array(48)));
@@ -236,7 +326,7 @@ describe('reconnectToMate', () => {
     };
     const mate = samplePairedMate();
 
-    const reconnectDone = reconnectToMate(mate, 'relay-ticket-1');
+    const reconnectDone = reconnectToMate(mate);
     await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
     const relay = FakeRelayTransport.instances[0]!;
     relay.queueReply(packet(2, new Uint8Array(48)));
@@ -249,7 +339,7 @@ describe('reconnectToMate', () => {
   it('surfaces an explicit mate rejection (e.g. device revoked) without relabeling it as a key mismatch', async () => {
     const mate = samplePairedMate();
 
-    const reconnectDone = reconnectToMate(mate, 'relay-ticket-1');
+    const reconnectDone = reconnectToMate(mate);
     await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
     const relay = FakeRelayTransport.instances[0]!;
     relay.queueReply(packet(5, new TextEncoder().encode(JSON.stringify({ message: 'this device has been revoked' }))));
@@ -257,23 +347,27 @@ describe('reconnectToMate', () => {
     await expect(reconnectDone).rejects.toThrow('this device has been revoked');
     await expect(reconnectDone).rejects.not.toBeInstanceOf(MateKeyMismatchError);
   });
+});
 
-  it('reuses the same relay ticket across repeated reconnects without any extra minting step', async () => {
-    const mate = samplePairedMate();
-    const ticket = 'static-relay-ticket';
+describe('refreshRelayToken', () => {
+  it('round-trips a relay.token.refresh request and persists the refreshed token', async () => {
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 86_400;
+    const client = { request: vi.fn().mockResolvedValue({
+      v: 1, id: 'req-1', type: 'relay.token.refresh.response', ts: new Date().toISOString(),
+      data: { relay_token: 'fresh-token', relay_token_expires_at: expiresAtSeconds },
+    }) };
 
-    const first = reconnectToMate(mate, ticket);
-    await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(1));
-    FakeRelayTransport.instances[0]!.queueReply(packet(2, new Uint8Array(48)));
-    await first;
+    await refreshRelayToken(client, 'mate-1');
 
-    const second = reconnectToMate(mate, ticket);
-    await vi.waitFor(() => expect(FakeRelayTransport.instances).toHaveLength(2));
-    FakeRelayTransport.instances[1]!.queueReply(packet(2, new Uint8Array(48)));
-    await second;
+    expect(client.request).toHaveBeenCalledWith('relay.token.refresh');
+    expect(updateRelayToken).toHaveBeenCalledWith('mate-1', 'fresh-token', expiresAtSeconds * 1000);
+  });
 
-    expect(FakeRelayTransport.instances[0]!.ticket).toBe(ticket);
-    expect(FakeRelayTransport.instances[1]!.ticket).toBe(ticket);
+  it('rejects when the mate returns no data', async () => {
+    const client = { request: vi.fn().mockResolvedValue({ v: 1, id: 'req-1', type: 'error', ts: new Date().toISOString() }) };
+
+    await expect(refreshRelayToken(client, 'mate-1')).rejects.toThrow('no data');
+    expect(updateRelayToken).not.toHaveBeenCalled();
   });
 });
 

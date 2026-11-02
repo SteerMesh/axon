@@ -66,3 +66,19 @@ events after the response frame has been delivered:
 
 Responses and pushed events share one serialized Noise send path so cipher
 nonces and WebSocket frame order remain identical.
+
+## Relay token refresh
+
+A device re-mints its device-scope Relay Access Token (see
+`docs/ARCHITECTURE.md`'s "Relay credentials" section) over this same
+encrypted channel before it expires, rather than waiting for the relay to
+reject an expired one:
+
+```json
+{"v":1,"id":"01J...","type":"relay.token.refresh","ts":"2026-10-24T00:00:00Z"}
+```
+
+The response data is `{"relay_token": "...", "relay_token_expires_at": 1234567890}`
+(`relay_token_expires_at` is Unix seconds, matching the token's own `exp`
+claim). The PWA persists the result in `mateStore.ts` so a later
+reload-and-reconnect still has a valid token.

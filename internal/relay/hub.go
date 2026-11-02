@@ -2,7 +2,7 @@ package relay
 
 import (
 	"context"
-	"crypto/subtle"
+	"crypto/ed25519"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+	"github.com/SteerMesh/axon/internal/security"
 	"github.com/coder/websocket"
 )
 
@@ -38,12 +39,12 @@ type RouteFrame struct {
 }
 
 type Hub struct {
-	mu      sync.RWMutex
-	token   string
-	mates   map[string]*peer
-	devices map[string]map[string]*peer
-	origins []string
-	push    *pushConfig
+	mu       sync.RWMutex
+	mateKeys map[string]ed25519.PublicKey
+	mates    map[string]*peer
+	devices  map[string]map[string]*peer
+	origins  []string
+	push     *pushConfig
 }
 
 // pushConfig holds everything needed to wake a backgrounded device over Web
@@ -64,8 +65,14 @@ type peer struct {
 	role     string
 }
 
-func NewHub(token string, origins ...string) *Hub {
-	return &Hub{token: token, mates: make(map[string]*peer), devices: make(map[string]map[string]*peer), origins: origins}
+// NewHub builds a relay hub that authenticates connections against
+// mateKeys, a registry of each mate's Ed25519 identity public key (see
+// cmd/axon-relay/main.go, AXON_RELAY_MATE_KEYS). The relay never stores or
+// issues credentials itself -- it only verifies Relay Access Tokens (see
+// internal/security/relaytoken.go) that a mate signed with the private
+// half of one of these keys.
+func NewHub(mateKeys map[string]ed25519.PublicKey, origins ...string) *Hub {
+	return &Hub{mateKeys: mateKeys, mates: make(map[string]*peer), devices: make(map[string]map[string]*peer), origins: origins}
 }
 
 // EnablePush turns on Web Push wake notifications. Until this is called the
@@ -95,13 +102,14 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !h.authorized(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 	mateID, role, deviceID := r.URL.Query().Get("mate_id"), r.URL.Query().Get("role"), r.URL.Query().Get("device_id")
 	if mateID == "" || (role != "mate" && role != "device") || (role == "device" && deviceID == "") {
 		http.Error(w, "invalid routing identity", http.StatusBadRequest)
+		return
+	}
+	if !h.authorizedConnect(r, mateID, role, deviceID) {
+		slog.Warn("Relay connection unauthorized", "mate_id", mateID, "role", role, "device_id", deviceID)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins, Subprotocols: []string{"axon.v1"}})
@@ -152,11 +160,13 @@ func (h *Hub) handleVAPIDKey(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"publicKey": publicKey})
 }
 
+// handlePushSubscribe requires a device-scope Relay Access Token bound to
+// the exact (mate_id, device_id) being subscribed or unsubscribed (see
+// authorizedDevice). That identity has to be parsed out of this request's
+// own body/query first -- unlike /v1/connect, there's no URL query
+// parameter carrying it uniformly across methods -- so each method below
+// resolves its identity before authorizing, never after.
 func (h *Hub) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
-	if !h.authorized(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 	h.mu.RLock()
 	push := h.push
 	h.mu.RUnlock()
@@ -173,6 +183,10 @@ func (h *Hub) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.MateID == "" || req.DeviceID == "" || req.Endpoint == "" || req.Keys.P256dh == "" || req.Keys.Auth == "" {
 			http.Error(w, "mate_id, device_id, endpoint, and keys are required", http.StatusBadRequest)
+			return
+		}
+		if !h.authorizedDevice(r, req.MateID, req.DeviceID) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		sub := Subscription{
@@ -201,6 +215,10 @@ func (h *Hub) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "mate_id and device_id are required", http.StatusBadRequest)
 			return
 		}
+		if !h.authorizedDevice(r, mateID, deviceID) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		if err := push.store.Delete(r.Context(), mateID, deviceID); err != nil {
 			http.Error(w, "delete subscription: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -211,20 +229,67 @@ func (h *Hub) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Hub) authorized(r *http.Request) bool {
-	header := r.Header.Get("Authorization")
-	want := "Bearer " + h.token
-	if h.token != "" && len(header) == len(want) && subtle.ConstantTimeCompare([]byte(header), []byte(want)) == 1 {
-		return true
+// authorizedConnect binds a Relay Access Token to the exact identity a
+// /v1/connect request claims: mate_id/role/device_id are parsed before
+// this runs (see ServeHTTP) specifically so the check below can verify
+// the token was issued for *this* mate_id and is of a scope *this* role
+// is allowed to use -- a token can't be replayed by a different mate or
+// across roles it wasn't minted for.
+func (h *Hub) authorizedConnect(r *http.Request, mateID, role, deviceID string) bool {
+	allowedScopes := []security.RelayTokenScope{security.RelayScopePairing, security.RelayScopeDevice}
+	if role == "mate" {
+		allowedScopes = []security.RelayTokenScope{security.RelayScopeMate}
 	}
-	encoded := "bearer." + base64.RawURLEncoding.EncodeToString([]byte(h.token))
-	for _, protocol := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
-		candidate := strings.TrimSpace(protocol)
-		if len(candidate) == len(encoded) && subtle.ConstantTimeCompare([]byte(candidate), []byte(encoded)) == 1 {
-			return true
+	return h.verifyRelayAccessToken(r, mateID, allowedScopes, deviceID)
+}
+
+// authorizedDevice binds a Relay Access Token to a REST request (push
+// subscribe/unsubscribe) that identifies its own mate_id/device_id in its
+// body or query params rather than in the URL the way /v1/connect does.
+// Callers must resolve those identity fields themselves and pass them in
+// here -- before this runs -- so the scope-and-identity check below is
+// always against the caller's own claimed identity, never an empty or
+// partially-parsed one. Only device-scope tokens are accepted: by the
+// time a device calls this, pairing has already completed and it holds a
+// real device-scope token (see security.PairingResult), so there is no
+// legitimate wildcard/pairing-scope use case here.
+func (h *Hub) authorizedDevice(r *http.Request, mateID, deviceID string) bool {
+	return h.verifyRelayAccessToken(r, mateID, []security.RelayTokenScope{security.RelayScopeDevice}, deviceID)
+}
+
+func (h *Hub) verifyRelayAccessToken(r *http.Request, mateID string, allowedScopes []security.RelayTokenScope, deviceID string) bool {
+	h.mu.RLock()
+	mateKey, known := h.mateKeys[mateID]
+	h.mu.RUnlock()
+	if !known {
+		return false
+	}
+	token := bearerToken(r)
+	if token == "" {
+		return false
+	}
+	_, err := security.VerifyRelayToken(token, mateKey, mateID, allowedScopes, deviceID, time.Now())
+	return err == nil
+}
+
+// bearerToken reads the RAT from the Authorization header (used by the
+// mate, and by any non-browser client) or, failing that, from the
+// `bearer.<base64url(token)>` WebSocket subprotocol (used by the browser
+// PWA, which cannot set arbitrary headers on a WebSocket handshake).
+func bearerToken(r *http.Request) string {
+	if header := r.Header.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
+		return strings.TrimPrefix(header, "Bearer ")
+	}
+	for _, candidate := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
+		candidate = strings.TrimSpace(candidate)
+		if encoded, ok := strings.CutPrefix(candidate, "bearer."); ok {
+			decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+			if err == nil {
+				return string(decoded)
+			}
 		}
 	}
-	return false
+	return ""
 }
 
 func (h *Hub) register(p *peer) error {

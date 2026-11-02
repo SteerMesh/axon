@@ -15,6 +15,7 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+	"github.com/SteerMesh/axon/internal/security"
 	"github.com/coder/websocket"
 )
 
@@ -33,7 +34,7 @@ func fakeResponse(status int) *http.Response {
 }
 
 func TestVAPIDKeyEndpointUnauthenticated(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "the-public-key", "the-private-key")
 	server := httptest.NewServer(hub)
 	defer server.Close()
@@ -56,7 +57,7 @@ func TestVAPIDKeyEndpointUnauthenticated(t *testing.T) {
 }
 
 func TestVAPIDKeyEndpointEmptyWhenPushDisabled(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
@@ -75,7 +76,7 @@ func TestVAPIDKeyEndpointEmptyWhenPushDisabled(t *testing.T) {
 }
 
 func TestPushSubscribeRequiresAuth(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
@@ -95,12 +96,13 @@ func TestPushSubscribeRequiresAuth(t *testing.T) {
 }
 
 func TestPushSubscribeReturns503WhenNotConfigured(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
+	// Push isn't configured, so the 503 fires before identity/auth is even
+	// parsed -- no Authorization header is needed to reach it.
 	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/push/subscribe", bytes.NewReader([]byte(`{}`)))
-	request.Header.Set("Authorization", "Bearer token")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -113,17 +115,23 @@ func TestPushSubscribeReturns503WhenNotConfigured(t *testing.T) {
 
 func TestPushSubscribePostUpsertsAndDeleteRemoves(t *testing.T) {
 	store := newTestSubscriptionStore(t)
-	hub := NewHub("token")
+	mate := newTestMate(t, "mate-1")
+	hub := NewHub(mate.keys())
 	hub.EnablePush(store, "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
+	// By the time a device calls push subscribe, pairing has already
+	// completed and it holds a real device-scope token (see
+	// security.PairingResult) -- that's the only scope authorizedDevice
+	// accepts here.
+	deviceToken := mate.mint(t, security.RelayScopeDevice, "device-1", time.Minute)
 
 	payload, _ := json.Marshal(map[string]any{
 		"mate_id": "mate-1", "device_id": "device-1", "endpoint": "https://push.example/ep",
 		"keys": map[string]string{"p256dh": "p256", "auth": "auth"},
 	})
 	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/push/subscribe", bytes.NewReader(payload))
-	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Authorization", "Bearer "+deviceToken)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +146,7 @@ func TestPushSubscribePostUpsertsAndDeleteRemoves(t *testing.T) {
 	}
 
 	deleteRequest, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/push/subscribe?mate_id=mate-1&device_id=device-1", nil)
-	deleteRequest.Header.Set("Authorization", "Bearer token")
+	deleteRequest.Header.Set("Authorization", "Bearer "+deviceToken)
 	deleteResponse, err := http.DefaultClient.Do(deleteRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -157,14 +165,15 @@ func TestPushSubscribeDeleteByBody(t *testing.T) {
 	if err := store.Upsert(context.Background(), Subscription{MateID: "mate-1", DeviceID: "device-1", Endpoint: "e", P256dh: "p", Auth: "a", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("token")
+	mate := newTestMate(t, "mate-1")
+	hub := NewHub(mate.keys())
 	hub.EnablePush(store, "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
 	body, _ := json.Marshal(map[string]string{"mate_id": "mate-1", "device_id": "device-1"})
 	deleteRequest, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/push/subscribe", bytes.NewReader(body))
-	deleteRequest.Header.Set("Authorization", "Bearer token")
+	deleteRequest.Header.Set("Authorization", "Bearer "+mate.mint(t, security.RelayScopeDevice, "device-1", time.Minute))
 	response, err := http.DefaultClient.Do(deleteRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -179,13 +188,14 @@ func TestPushSubscribeDeleteByBody(t *testing.T) {
 }
 
 func TestPushSubscribeMethodNotAllowed(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
+	// GET falls straight to "method not allowed" -- no identity to parse,
+	// so no Authorization header is needed to reach it.
 	request, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/push/subscribe", nil)
-	request.Header.Set("Authorization", "Bearer token")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -197,13 +207,15 @@ func TestPushSubscribeMethodNotAllowed(t *testing.T) {
 }
 
 func TestPushSubscribeDeleteRequiresIdentity(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
+	// Neither mate_id nor device_id are resolvable from an empty body, so
+	// this is a 400 before authorizedDevice is ever called -- no
+	// Authorization header is needed to reach it.
 	request, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/push/subscribe", bytes.NewReader([]byte(`{}`)))
-	request.Header.Set("Authorization", "Bearer token")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +228,8 @@ func TestPushSubscribeDeleteRequiresIdentity(t *testing.T) {
 
 func TestPushSubscribePostStoreErrorIsSurfaced(t *testing.T) {
 	store := newTestSubscriptionStore(t)
-	hub := NewHub("token")
+	mate := newTestMate(t, "mate-1")
+	hub := NewHub(mate.keys())
 	hub.EnablePush(store, "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
@@ -227,7 +240,7 @@ func TestPushSubscribePostStoreErrorIsSurfaced(t *testing.T) {
 		"keys": map[string]string{"p256dh": "p", "auth": "a"},
 	})
 	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/push/subscribe", bytes.NewReader(payload))
-	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Authorization", "Bearer "+mate.mint(t, security.RelayScopeDevice, "device-1", time.Minute))
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -240,14 +253,15 @@ func TestPushSubscribePostStoreErrorIsSurfaced(t *testing.T) {
 
 func TestPushSubscribeDeleteStoreErrorIsSurfaced(t *testing.T) {
 	store := newTestSubscriptionStore(t)
-	hub := NewHub("token")
+	mate := newTestMate(t, "mate-1")
+	hub := NewHub(mate.keys())
 	hub.EnablePush(store, "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
 	_ = store.Close() // force subsequent store operations to fail
 
 	request, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/push/subscribe?mate_id=mate-1&device_id=device-1", nil)
-	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Authorization", "Bearer "+mate.mint(t, security.RelayScopeDevice, "device-1", time.Minute))
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -259,14 +273,15 @@ func TestPushSubscribeDeleteStoreErrorIsSurfaced(t *testing.T) {
 }
 
 func TestPushSubscribePostRejectsIncompleteBody(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
+	// Missing device_id/endpoint/keys is a 400 before authorizedDevice is
+	// ever called -- no Authorization header is needed to reach it.
 	payload, _ := json.Marshal(map[string]any{"mate_id": "mate-1"})
 	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/push/subscribe", bytes.NewReader(payload))
-	request.Header.Set("Authorization", "Bearer token")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +303,7 @@ func TestHubTriggerPushSendsContentFreePayload(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(store, "pub", "priv")
 
 	sent := make(chan []byte, 1)
@@ -320,7 +335,7 @@ func TestHubTriggerPushSendsContentFreePayload(t *testing.T) {
 }
 
 func TestHubTriggerPushIgnoresMateTargets(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
 	called := false
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
@@ -335,7 +350,7 @@ func TestHubTriggerPushIgnoresMateTargets(t *testing.T) {
 }
 
 func TestHubTriggerPushNoopWhenNoSubscription(t *testing.T) {
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
 	called := false
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
@@ -357,7 +372,7 @@ func TestHubTriggerPushDeletesSubscriptionOnGoneResponse(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(store, "pub", "priv")
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
 		return fakeResponse(http.StatusGone), nil
@@ -387,7 +402,7 @@ func TestHubTriggerPushDeletesSubscriptionOnNotFoundResponse(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(store, "pub", "priv")
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
 		return fakeResponse(http.StatusNotFound), nil
@@ -413,7 +428,7 @@ func TestHubTriggerPushKeepsSubscriptionOnSuccess(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(store, "pub", "priv")
 	done := make(chan struct{})
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
@@ -442,7 +457,7 @@ func TestHubTriggerPushIgnoresSendError(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(store, "pub", "priv")
 	done := make(chan struct{})
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
@@ -467,7 +482,7 @@ func TestHubTriggerPushIgnoresSendError(t *testing.T) {
 
 func TestHubTriggerPushLookupErrorIsNotTreatedAsMissing(t *testing.T) {
 	store := newTestSubscriptionStore(t)
-	hub := NewHub("token")
+	hub := NewHub(nil)
 	hub.EnablePush(store, "pub", "priv")
 	called := false
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
@@ -491,7 +506,8 @@ func TestHubReadLoopTriggersPushWhenDeviceOffline(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub("test-token")
+	mate := newTestMate(t, "mate-1")
+	hub := NewHub(mate.keys())
 	hub.EnablePush(store, "pub", "priv")
 	server := httptest.NewServer(hub)
 	defer server.Close()
@@ -504,12 +520,12 @@ func TestHubReadLoopTriggersPushWhenDeviceOffline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	mate := dialPeer(t, ctx, server.URL, "mate-1", "mate", "")
-	defer mate.CloseNow()
+	mateConn := dialPeer(t, ctx, server.URL, mate, "mate-1", "mate", "")
+	defer mateConn.CloseNow()
 
 	// device-1 never connects, so the mate's frame to it has no target peer.
 	encoded, _ := json.Marshal(RouteFrame{Version: 1, MateID: "mate-1", To: "device-1", Payload: []byte("secret")})
-	if err := mate.Write(ctx, websocket.MessageBinary, encoded); err != nil {
+	if err := mateConn.Write(ctx, websocket.MessageBinary, encoded); err != nil {
 		t.Fatal(err)
 	}
 

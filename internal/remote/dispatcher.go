@@ -10,6 +10,7 @@ import (
 	"github.com/SteerMesh/axon/internal/authz"
 	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/meshcli"
+	"github.com/SteerMesh/axon/internal/security"
 	"github.com/SteerMesh/axon/internal/session"
 	"github.com/SteerMesh/axon/internal/store"
 	"github.com/SteerMesh/axon/internal/target"
@@ -28,6 +29,8 @@ type Dispatcher struct {
 	store     *store.Store
 	templates *templates.Catalog
 	mesh      meshcli.Options
+	mateID    string
+	identity  security.Identity
 }
 
 type Subscription struct {
@@ -46,6 +49,16 @@ func (d *Dispatcher) WithMeshOptions(options meshcli.Options) *Dispatcher {
 
 func (d *Dispatcher) WithTemplates(catalog templates.Catalog) *Dispatcher {
 	d.templates = &catalog
+	return d
+}
+
+// WithIdentity gives the dispatcher the mate's own signing identity so it
+// can mint fresh device-scope Relay Access Tokens for the
+// "relay.token.refresh" in-channel request (see Handle below), mirroring
+// what PairingManager.Complete does when a device first pairs.
+func (d *Dispatcher) WithIdentity(mateID string, identity security.Identity) *Dispatcher {
+	d.mateID = mateID
+	d.identity = identity
 	return d
 }
 
@@ -227,6 +240,18 @@ func (d *Dispatcher) Handle(ctx context.Context, device DeviceContext, request p
 		}
 		if operationErr == nil {
 			result, operationErr = d.manager.Replay(request.SessionID, params.FromSeq)
+		}
+	case "relay.token.refresh":
+		// Re-mints a device-scope RAT for the device making the request,
+		// over the already-open, Noise-encrypted channel -- mirroring what
+		// PairingManager.Complete does at pairing time. Lets a device renew
+		// its token before expiry without re-scanning a QR code. Mint
+		// itself rejects a Dispatcher with no identity configured.
+		var token string
+		var claims security.RelayTokenClaims
+		token, claims, operationErr = security.MintRelayToken(d.identity, d.mateID, security.RelayScopeDevice, device.ID, security.DeviceRelayTokenTTL)
+		if operationErr == nil {
+			result = map[string]any{"relay_token": token, "relay_token_expires_at": claims.ExpiresAt}
 		}
 	default:
 		operationErr = fmt.Errorf("unsupported remote command %q", request.Type)
