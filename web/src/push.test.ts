@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 describe('enableWakeNotifications', () => {
-  const config = { relayUrl: 'wss://relay.example/v1/connect', relayTicket: 'ticket-123', mateId: 'mate-1', deviceId: 'device-1' };
+  const config = { relayUrl: 'wss://relay.example/v1/connect', relayToken: 'ticket-123', mateId: 'mate-1', deviceId: 'device-1' };
 
   it('does nothing and reports false when permission is denied', async () => {
     const fetchMock = vi.fn();
@@ -144,7 +144,7 @@ describe('enableWakeNotifications', () => {
 });
 
 describe('disableWakeNotifications', () => {
-  const config = { relayUrl: 'wss://relay.example/v1/connect', relayTicket: 'ticket-123', mateId: 'mate-1', deviceId: 'device-1' };
+  const config = { relayUrl: 'wss://relay.example/v1/connect', relayToken: 'ticket-123', mateId: 'mate-1', deviceId: 'device-1' };
 
   it('unsubscribes the browser subscription and deletes the relay record', async () => {
     const unsubscribe = vi.fn(async () => true);

@@ -278,3 +278,63 @@ describe('QR pairing form', () => {
     expect(document.querySelector('#banner')!.textContent).toBe('pairing code has expired');
   });
 });
+
+// scheduleRelayTokenRefresh is private to main.ts; these drive it the only
+// way a caller can -- through onConnected, reached here via the QR pairing
+// form -- and observe it only through its two visible effects: whether
+// refreshRelayToken gets called, and that nothing it does ever blows up or
+// reaches for a destructive mateStore call.
+describe('relay token refresh scheduling', () => {
+  async function connect(mateId: string): Promise<void> {
+    listMates.mockResolvedValue([]);
+    pairAndConnect.mockResolvedValue(samplePairedConnection(mateId));
+
+    await import('./main');
+    await vi.waitFor(() => expect(pairingHidden()).toBe(false));
+    document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value = 'encoded-bundle';
+    document.querySelector<HTMLButtonElement>('#pairing-form button[type="submit"]')!.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLElement>('#landing')!.hidden).toBe(false));
+  }
+
+  it('refreshes proactively when the stored token is within the expiry margin', async () => {
+    const mateId = 'mate-margin';
+    // Margin is 60 minutes (RELAY_TOKEN_REFRESH_MARGIN_MS) -- 30 minutes
+    // left is well inside it.
+    getMate.mockResolvedValue(samplePairedMate({ mateId, relayTokenExpiresAt: Date.now() + 30 * 60 * 1000 }));
+    refreshRelayToken.mockResolvedValue(undefined);
+
+    await connect(mateId);
+
+    await vi.waitFor(() => expect(refreshRelayToken).toHaveBeenCalledWith(expect.anything(), mateId));
+  });
+
+  it('does not refresh when the stored token is nowhere near expiring', async () => {
+    const mateId = 'mate-fresh';
+    getMate.mockResolvedValue(samplePairedMate({ mateId, relayTokenExpiresAt: Date.now() + 2 * 24 * 60 * 60 * 1000 }));
+
+    await connect(mateId);
+
+    // getMate resolving is proof the scheduled check actually ran and made
+    // its decision; asserting on refreshRelayToken only after that is what
+    // rules out a refresh this check should not have triggered.
+    await vi.waitFor(() => expect(getMate).toHaveBeenCalledWith(mateId));
+    expect(refreshRelayToken).not.toHaveBeenCalled();
+  });
+
+  it('does not crash or touch mateStore destructively when a scheduled refresh fails', async () => {
+    const mateId = 'mate-refresh-fails';
+    getMate.mockResolvedValue(samplePairedMate({ mateId, relayTokenExpiresAt: Date.now() + 10 * 60 * 1000 }));
+    refreshRelayToken.mockRejectedValue(new Error('relay unreachable'));
+
+    await connect(mateId);
+
+    await vi.waitFor(() => expect(refreshRelayToken).toHaveBeenCalledWith(expect.anything(), mateId));
+    // A failed refresh is surfaced (best-effort) but must never clear or
+    // invalidate the mate's existing record -- main.ts has no call that
+    // would do that; deleteMate is the only destructive mateStore
+    // operation it ever performs, and only from the explicit "Forget"
+    // action, never from a refresh failure.
+    expect(deleteMate).not.toHaveBeenCalled();
+    expect(document.querySelector('#connection-state')!.textContent).toBe('Encrypted');
+  });
+});

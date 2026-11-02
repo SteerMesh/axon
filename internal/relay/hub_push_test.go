@@ -95,6 +95,59 @@ func TestPushSubscribeRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestPushSubscribeRejectsNonDeviceScopedTokens is the scope-confusion
+// regression this feature exists to prevent: a pairing-scope token (valid
+// before a device's real ID is known, and wildcarded to any device_id) or
+// a mate-scope token must not authorize push subscribe/unsubscribe, even
+// though both are perfectly valid tokens signed by a registered mate. Only
+// a device-scope token -- which a device only holds once pairing has
+// actually completed -- is accepted (see authorizedDevice).
+func TestPushSubscribeRejectsNonDeviceScopedTokens(t *testing.T) {
+	mate := newTestMate(t, "mate-1")
+	hub := NewHub(mate.keys())
+	hub.EnablePush(newTestSubscriptionStore(t), "pub", "priv")
+	server := httptest.NewServer(hub)
+	defer server.Close()
+
+	payload, _ := json.Marshal(map[string]any{
+		"mate_id": "mate-1", "device_id": "device-1", "endpoint": "https://push.example/ep",
+		"keys": map[string]string{"p256dh": "p", "auth": "a"},
+	})
+
+	for _, test := range []struct {
+		name  string
+		token string
+	}{
+		{"pairing-scope token, wildcard device_id", mate.mint(t, security.RelayScopePairing, "", time.Minute)},
+		{"pairing-scope token, matching device_id", mate.mint(t, security.RelayScopePairing, "device-1", time.Minute)},
+		{"mate-scope token", mate.mint(t, security.RelayScopeMate, "", time.Minute)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			postRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/push/subscribe", bytes.NewReader(payload))
+			postRequest.Header.Set("Authorization", "Bearer "+test.token)
+			postResponse, err := http.DefaultClient.Do(postRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = postResponse.Body.Close()
+			if postResponse.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("POST status=%d, want %d", postResponse.StatusCode, http.StatusUnauthorized)
+			}
+
+			deleteRequest, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/push/subscribe?mate_id=mate-1&device_id=device-1", nil)
+			deleteRequest.Header.Set("Authorization", "Bearer "+test.token)
+			deleteResponse, err := http.DefaultClient.Do(deleteRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = deleteResponse.Body.Close()
+			if deleteResponse.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("DELETE status=%d, want %d", deleteResponse.StatusCode, http.StatusUnauthorized)
+			}
+		})
+	}
+}
+
 func TestPushSubscribeReturns503WhenNotConfigured(t *testing.T) {
 	hub := NewHub(nil)
 	server := httptest.NewServer(hub)

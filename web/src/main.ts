@@ -354,7 +354,7 @@ async function onConnected(paired: PairedConnection): Promise<void> {
 		void enableWakeNotifications(
 			serviceWorkerRegistration,
 			{
-				relayUrl: secureConnection.relayUrl, relayTicket: secureConnection.relayToken,
+				relayUrl: secureConnection.relayUrl, relayToken: secureConnection.relayToken,
 				mateId: secureConnection.mateId, deviceId: secureConnection.deviceId,
 			},
 			Notification,
@@ -481,7 +481,7 @@ async function forgetMate(mate: PairedMate): Promise<void> {
 		void currentDeviceId()
 			.then((deviceId) => disableWakeNotifications(
 				serviceWorkerRegistration!,
-				{ relayUrl: mate.relayUrl, relayTicket: mate.relayToken, mateId: mate.mateId, deviceId },
+				{ relayUrl: mate.relayUrl, relayToken: mate.relayToken, mateId: mate.mateId, deviceId },
 			))
 			.catch(() => {
 				// Best-effort: see the comment above.
