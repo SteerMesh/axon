@@ -62,6 +62,16 @@ func TestEndpointAuthenticatesAndDispatchesEncryptedRequest(t *testing.T) {
 	if err != nil || pairReply[0] != packetPairingReply {
 		t.Fatalf("pairing failed: %v", err)
 	}
+	var pairingResult security.PairingResult
+	if err := json.Unmarshal(pairReply[1:], &pairingResult); err != nil {
+		t.Fatal(err)
+	}
+	if pairingResult.Record.DeviceID != "device-1" {
+		t.Fatalf("unexpected pairing record: %+v", pairingResult.Record)
+	}
+	if _, err := security.VerifyRelayToken(pairingResult.RelayToken, mate.SigningPublic, "mate-1", []security.RelayTokenScope{security.RelayScopeDevice}, "device-1", time.Now()); err != nil {
+		t.Fatalf("device relay token from pairing reply did not verify: %v", err)
+	}
 
 	prologue := []byte("mesh-axon-v1:mate-1:device-1")
 	initiator, _ := security.NewIKInitiator(deviceIdentity.Noise, mate.Noise.Public, prologue)

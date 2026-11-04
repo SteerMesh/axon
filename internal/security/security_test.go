@@ -24,12 +24,22 @@ func TestPairingBindsSigningAndNoiseKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := manager.Complete(bundle.OneTimeToken, presentation)
+	result, err := manager.Complete(bundle.OneTimeToken, presentation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !VerifyDeviceRecord(record, mate.SigningPublic) {
+	if !VerifyDeviceRecord(result.Record, mate.SigningPublic) {
 		t.Fatal("mate binding did not verify")
+	}
+	if result.RelayToken == "" || result.RelayTokenExpiresAt == 0 {
+		t.Fatal("pairing completion did not mint a device relay token")
+	}
+	claims, err := VerifyRelayToken(result.RelayToken, mate.SigningPublic, "mate-1", []RelayTokenScope{RelayScopeDevice}, "device-1", time.Now())
+	if err != nil {
+		t.Fatalf("device relay token did not verify: %v", err)
+	}
+	if claims.DeviceID != "device-1" || claims.Scope != RelayScopeDevice {
+		t.Fatalf("unexpected device relay token claims: %+v", claims)
 	}
 	if _, err := manager.Complete(bundle.OneTimeToken, presentation); err == nil {
 		t.Fatal("one-time token was accepted twice")
@@ -68,6 +78,16 @@ func TestPairingValidationAndQRPayload(t *testing.T) {
 	bundle, _ := manager.Issue(time.Minute)
 	if payload, err := bundle.QRPayload(); err != nil || payload == "" {
 		t.Fatalf("QR payload=%q err=%v", payload, err)
+	}
+	// The bundle's RelayToken is pairing-scoped and wildcarded to any
+	// device_id, since the real device_id isn't known until the device
+	// presents itself.
+	claims, err := VerifyRelayToken(bundle.RelayToken, mate.SigningPublic, "mate", []RelayTokenScope{RelayScopePairing}, "any-device-id", time.Now())
+	if err != nil {
+		t.Fatalf("pairing relay token did not verify: %v", err)
+	}
+	if claims.Scope != RelayScopePairing || claims.DeviceID != "" {
+		t.Fatalf("unexpected pairing relay token claims: %+v", claims)
 	}
 	presentation, _ := SignPresentation(bundle.OneTimeToken, bundle.MateID, device, "")
 	if _, err := manager.Complete(bundle.OneTimeToken, presentation); err == nil {

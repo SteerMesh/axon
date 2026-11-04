@@ -11,6 +11,7 @@ import (
 	"github.com/SteerMesh/axon/internal/authz"
 	"github.com/SteerMesh/axon/internal/domain"
 	"github.com/SteerMesh/axon/internal/meshcli"
+	"github.com/SteerMesh/axon/internal/security"
 	"github.com/SteerMesh/axon/internal/session"
 	"github.com/SteerMesh/axon/internal/target"
 	"github.com/SteerMesh/axon/internal/templates"
@@ -254,6 +255,48 @@ func TestDispatcherSubscribeFailures(t *testing.T) {
 				t.Fatalf("response = %+v, error = %+v", response, got)
 			}
 		})
+	}
+}
+
+func TestDispatcherRefreshesRelayToken(t *testing.T) {
+	manager := session.NewManager(1024)
+	identity, err := security.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewDispatcher(manager, nil).WithIdentity("mate-1", identity)
+	device := DeviceContext{ID: "device-1", Role: authz.RoleOwner}
+
+	response := dispatcher.Handle(context.Background(), device, requestEnvelope("relay.token.refresh", "", "refresh-1", nil))
+	if response.Type == "error" {
+		t.Fatalf("refresh failed: %s", response.Data)
+	}
+	var result struct {
+		RelayToken          string `json:"relay_token"`
+		RelayTokenExpiresAt int64  `json:"relay_token_expires_at"`
+	}
+	if err := json.Unmarshal(response.Data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.RelayToken == "" || result.RelayTokenExpiresAt == 0 {
+		t.Fatalf("refresh returned empty token: %+v", result)
+	}
+	claims, err := security.VerifyRelayToken(result.RelayToken, identity.SigningPublic, "mate-1", []security.RelayTokenScope{security.RelayScopeDevice}, "device-1", time.Now())
+	if err != nil {
+		t.Fatalf("refreshed token did not verify: %v", err)
+	}
+	if claims.DeviceID != "device-1" {
+		t.Fatalf("refreshed token bound to wrong device: %+v", claims)
+	}
+}
+
+func TestDispatcherRefreshRelayTokenRequiresIdentity(t *testing.T) {
+	manager := session.NewManager(1024)
+	dispatcher := NewDispatcher(manager, nil)
+	device := DeviceContext{ID: "device-1", Role: authz.RoleOwner}
+	response := dispatcher.Handle(context.Background(), device, requestEnvelope("relay.token.refresh", "", "refresh-1", nil))
+	if response.Type != "error" {
+		t.Fatal("refresh succeeded without a configured identity")
 	}
 }
 

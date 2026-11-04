@@ -38,10 +38,41 @@ protocol validation, but it is not yet a production release.
   WebSocket -- it exists specifically to reach a client that has none.
   Subscription cleanup is wired into the PWA's forget-device flow, so a
   forgotten device stops receiving wake pings.
+- Scoped, expiring, self-verifying relay route credentials (Relay Access
+  Tokens). Every mate and every device now authorizes its relay connection
+  (and the push-subscribe REST calls above) with its own signed, scoped,
+  time-limited token instead of one static shared secret used identically
+  by everyone -- see `docs/ARCHITECTURE.md`'s "Relay credentials" section.
+  The device-scope token is persisted alongside the rest of the PWA's
+  `PairedMate` record and renewed in-channel via `relay.token.refresh`
+  (see `docs/PROTOCOL.md`) before it expires. `devices.revoke` also now
+  drops the device's live channel immediately rather than only via token
+  expiry.
+
+## Required upgrade action
+
+Upgrading to this release is a **breaking change** for any deployed relay:
+`AXON_RELAY_TOKEN` is gone. The relay now authenticates connections against
+each mate's Ed25519 **public** signing key instead of a shared secret it
+used to be handed directly, so an operator must provision
+`AXON_RELAY_MATE_KEYS` before restarting `axon-relay`:
+
+```
+AXON_RELAY_MATE_KEYS=mate-id-1=<base64url-public-key>,mate-id-2=<base64url-public-key>
+```
+
+Run `mesh-axon identity` on each mate to get the `mate_id=base64url-pubkey`
+value to add to the relay's `AXON_RELAY_MATE_KEYS`; it reads (or lazily
+creates) that mate's identity file directly and prints its `mate_id`,
+public signing key, and a ready-to-paste `AXON_RELAY_MATE_KEYS` fragment --
+no running `serve` daemon required, and it never prints either private
+key. A relay started without `AXON_RELAY_MATE_KEYS` (or with it empty) now
+refuses to start. Mates no longer take a `--relay-token` flag or read
+`AXON_RELAY_TOKEN` at all; that configuration can be removed from mate
+deployments.
 
 ## Production hardening remaining
 
-- Replace the relay bootstrap token with scoped, expiring route credentials.
 - Add deployment manifests, relay rate limits, metrics, and operational alerts.
 - Complete native-client hardware-backed presence assertions if biometric
   confirmation is required.

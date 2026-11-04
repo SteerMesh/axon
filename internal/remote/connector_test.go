@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -25,7 +26,8 @@ import (
 func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hub := relay.NewHub("relay-token")
+	mate, _ := security.GenerateIdentity()
+	hub := relay.NewHub(map[string]ed25519.PublicKey{"mate-1": mate.SigningPublic})
 	server := httptest.NewServer(hub)
 	defer server.Close()
 	persistent, err := store.Open(filepath.Join(t.TempDir(), "axon.db"))
@@ -33,7 +35,6 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer persistent.Close()
-	mate, _ := security.GenerateIdentity()
 	device, _ := security.GenerateIdentity()
 	record := security.DeviceRecord{
 		MateID: "mate-1", DeviceID: "device-1", DeviceSigningKey: device.SigningPublic,
@@ -50,7 +51,7 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(manager, persistent))
-	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
+	connector := NewConnector(server.URL, "mate-1", mate, endpoint)
 	go func() { _ = connector.Run(ctx) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for !hub.MateConnected("mate-1") && time.Now().Before(deadline) {
@@ -60,9 +61,13 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 		t.Fatal("Mate did not connect to relay")
 	}
 
+	deviceToken, _, err := security.MintRelayToken(mate, "mate-1", security.RelayScopeDevice, "device-1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deviceURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/connect?mate_id=mate-1&role=device&device_id=device-1"
 	header := make(http.Header)
-	header.Set("Authorization", "Bearer relay-token")
+	header.Set("Authorization", "Bearer "+deviceToken)
 	conn, _, err := websocket.Dial(ctx, deviceURL, &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +144,8 @@ func TestConnectorCarriesEncryptedCommandThroughRelay(t *testing.T) {
 func TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hub := relay.NewHub("relay-token")
+	mate, _ := security.GenerateIdentity()
+	hub := relay.NewHub(map[string]ed25519.PublicKey{"mate-1": mate.SigningPublic})
 	server := httptest.NewServer(hub)
 	defer server.Close()
 	persistent, err := store.Open(filepath.Join(t.TempDir(), "axon.db"))
@@ -147,7 +153,6 @@ func TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit(t *te
 		t.Fatal(err)
 	}
 	defer persistent.Close()
-	mate, _ := security.GenerateIdentity()
 	device, _ := security.GenerateIdentity()
 	record := security.DeviceRecord{
 		MateID: "mate-1", DeviceID: "device-1", DeviceSigningKey: device.SigningPublic,
@@ -164,7 +169,7 @@ func TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit(t *te
 		t.Fatal(err)
 	}
 	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(manager, persistent))
-	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
+	connector := NewConnector(server.URL, "mate-1", mate, endpoint)
 	go func() { _ = connector.Run(ctx) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for !hub.MateConnected("mate-1") && time.Now().Before(deadline) {
@@ -174,9 +179,13 @@ func TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit(t *te
 		t.Fatal("Mate did not connect to relay")
 	}
 
+	deviceToken, _, err := security.MintRelayToken(mate, "mate-1", security.RelayScopeDevice, "device-1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deviceURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/connect?mate_id=mate-1&role=device&device_id=device-1"
 	header := make(http.Header)
-	header.Set("Authorization", "Bearer relay-token")
+	header.Set("Authorization", "Bearer "+deviceToken)
 	conn, _, err := websocket.Dial(ctx, deviceURL, &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
 	if err != nil {
 		t.Fatal(err)
@@ -240,12 +249,53 @@ func TestConnectorSurvivesPushedOutputLargerThanTheLibraryDefaultReadLimit(t *te
 	}
 }
 
+func TestConnectorMintsFreshMateScopedTokenPerDial(t *testing.T) {
+	identity, _ := security.GenerateIdentity()
+	var capturedTokens []string
+	upgrader := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") {
+			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			return
+		}
+		capturedTokens = append(capturedTokens, strings.TrimPrefix(header, "Bearer "))
+		// Reject every dial after capturing its token so Run retries and we
+		// can observe more than one freshly minted token.
+		http.Error(w, "reject to force a retry", http.StatusUnauthorized)
+	}))
+	defer upgrader.Close()
+
+	connector := NewConnector(upgrader.URL, "mate-1", identity, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	_ = connector.Run(ctx)
+
+	if len(capturedTokens) < 2 {
+		t.Fatalf("expected at least two dial attempts, got %d", len(capturedTokens))
+	}
+	seen := map[string]bool{}
+	for _, token := range capturedTokens {
+		if seen[token] {
+			t.Fatalf("connector reused a mate relay token across dial attempts")
+		}
+		seen[token] = true
+		claims, err := security.VerifyRelayToken(token, identity.SigningPublic, "mate-1", []security.RelayTokenScope{security.RelayScopeMate}, "", time.Now())
+		if err != nil {
+			t.Fatalf("minted token did not verify: %v", err)
+		}
+		if claims.DeviceID != "" {
+			t.Fatalf("mate-scope token carried a non-wildcard device_id: %+v", claims)
+		}
+	}
+}
+
 func TestConnectorValidationAndCancellation(t *testing.T) {
-	connector := NewConnector("ftp://relay.example", "token", "mate", nil)
+	identity, _ := security.GenerateIdentity()
+	connector := NewConnector("ftp://relay.example", "mate", identity, nil)
 	if err := connector.runOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported") {
 		t.Fatalf("unsupported URL error=%v", err)
 	}
-	connector = NewConnector("%", "token", "mate", nil)
+	connector = NewConnector("%", "mate", identity, nil)
 	if err := connector.runOnce(context.Background()); err == nil {
 		t.Fatal("malformed URL accepted")
 	}
@@ -255,13 +305,13 @@ func TestConnectorValidationAndCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	connector = NewConnector("ftp://relay.example", "token", "mate", nil)
+	connector = NewConnector("ftp://relay.example", "mate", identity, nil)
 	if err := connector.Run(ctx); err != context.Canceled {
 		t.Fatalf("canceled run error=%v", err)
 	}
 
 	ctx, cancel = context.WithCancel(context.Background())
-	connector = NewConnector("ftp://relay.example", "token", "mate", nil)
+	connector = NewConnector("ftp://relay.example", "mate", identity, nil)
 	done := make(chan error, 1)
 	go func() { done <- connector.Run(ctx) }()
 	time.Sleep(20 * time.Millisecond)
@@ -284,7 +334,8 @@ func TestConnectorValidationAndCancellation(t *testing.T) {
 func TestConnectorRepliesWithErrorPacketOnRejectedFrame(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hub := relay.NewHub("relay-token")
+	mate, _ := security.GenerateIdentity()
+	hub := relay.NewHub(map[string]ed25519.PublicKey{"mate-1": mate.SigningPublic})
 	server := httptest.NewServer(hub)
 	defer server.Close()
 	persistent, err := store.Open(filepath.Join(t.TempDir(), "axon.db"))
@@ -292,9 +343,8 @@ func TestConnectorRepliesWithErrorPacketOnRejectedFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer persistent.Close()
-	mate, _ := security.GenerateIdentity()
 	endpoint := NewEndpoint("mate-1", mate, persistent, NewDispatcher(session.NewManager(1024), persistent))
-	connector := NewConnector(server.URL, "relay-token", "mate-1", endpoint)
+	connector := NewConnector(server.URL, "mate-1", mate, endpoint)
 	go func() { _ = connector.Run(ctx) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for !hub.MateConnected("mate-1") && time.Now().Before(deadline) {
@@ -304,9 +354,13 @@ func TestConnectorRepliesWithErrorPacketOnRejectedFrame(t *testing.T) {
 		t.Fatal("Mate did not connect to relay")
 	}
 
+	deviceToken, _, err := security.MintRelayToken(mate, "mate-1", security.RelayScopeDevice, "device-1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deviceURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/connect?mate_id=mate-1&role=device&device_id=device-1"
 	header := make(http.Header)
-	header.Set("Authorization", "Bearer relay-token")
+	header.Set("Authorization", "Bearer "+deviceToken)
 	conn, _, err := websocket.Dial(ctx, deviceURL, &websocket.DialOptions{HTTPHeader: header, Subprotocols: []string{"axon.v1"}})
 	if err != nil {
 		t.Fatal(err)

@@ -29,11 +29,24 @@ type Server struct {
 	conns    map[net.Conn]struct{}
 	pairing  *security.PairingManager
 	store    *store.Store
+	revoker  DeviceRevoker
+}
+
+// DeviceRevoker drops a device's live relay channel immediately. It is
+// satisfied by *remote.Endpoint; defined here (rather than importing
+// remote) to keep ipc's dependency on the remote package to this one
+// narrow method.
+type DeviceRevoker interface {
+	Revoke(deviceID string)
 }
 
 type Options struct {
 	Pairing *security.PairingManager
 	Store   *store.Store
+	// Revoker, if set, is notified by devices.revoke so a revoked device's
+	// live connection is dropped immediately instead of only losing access
+	// the next time its Relay Access Token expires.
+	Revoker DeviceRevoker
 }
 
 func DefaultSocketPath() (string, error) {
@@ -68,6 +81,7 @@ func ListenWithOptions(manager *session.Manager, socketPath string, options Opti
 		conns:    make(map[net.Conn]struct{}),
 		pairing:  options.Pairing,
 		store:    options.Store,
+		revoker:  options.Revoker,
 	}
 	server.wg.Add(1)
 	go server.accept()
@@ -224,6 +238,15 @@ func (s *Server) dispatch(request Request) Response {
 		}
 		if err := s.store.RevokeDevice(context.Background(), params.DeviceID, time.Now()); err != nil {
 			return mapError(request.ID, err)
+		}
+		// Drop the device's live relay channel now, rather than relying
+		// solely on its Relay Access Token expiring (device tokens live up
+		// to 24h -- see security.DeviceRelayTokenTTL). The relay itself
+		// can't be told to revoke a token (there's no relay-side storage
+		// to revoke from), so immediate revocation has to happen here, at
+		// the mate, by tearing down the Noise channel the device was using.
+		if s.revoker != nil {
+			s.revoker.Revoke(params.DeviceID)
 		}
 		return resultResponse(request.ID, map[string]bool{"revoked": true})
 	default:

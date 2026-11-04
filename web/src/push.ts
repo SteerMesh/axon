@@ -10,7 +10,8 @@
 
 export interface WakeNotificationConfig {
   relayUrl: string;
-  relayTicket: string;
+  /** The device-scope Relay Access Token this device last authenticated with. */
+  relayToken: string;
   mateId: string;
   deviceId: string;
 }
@@ -50,7 +51,7 @@ export async function enableWakeNotifications(
 
     const subscribeResponse = await fetch(relayHttpURL(config.relayUrl, '/v1/push/subscribe'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.relayTicket}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.relayToken}` },
       body: JSON.stringify({ mate_id: config.mateId, device_id: config.deviceId, endpoint, keys }),
     });
     return subscribeResponse.ok;
@@ -79,7 +80,7 @@ export async function disableWakeNotifications(
     const url = new URL(relayHttpURL(config.relayUrl, '/v1/push/subscribe'));
     url.searchParams.set('mate_id', config.mateId);
     url.searchParams.set('device_id', config.deviceId);
-    await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${config.relayTicket}` } });
+    await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${config.relayToken}` } });
   } catch {
     // Best-effort: the relay will still prune the row if it hits a 410/404.
   }

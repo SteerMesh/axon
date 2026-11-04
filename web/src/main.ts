@@ -2,10 +2,23 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { currentDeviceId, MateKeyMismatchError, type PairedConnection, pairAndConnect, reconnectToMate } from './pairing';
+import {
+	currentDeviceId, MateKeyMismatchError, type PairedConnection, pairAndConnect,
+	reconnectToMate, refreshRelayToken, RelayTokenExpiredError,
+} from './pairing';
 import { AxonClient } from './client';
-import { deleteMate, listMates, type PairedMate } from './mateStore';
+import { deleteMate, getMate, listMates, type PairedMate } from './mateStore';
 import { disableWakeNotifications, enableWakeNotifications } from './push';
+
+/**
+ * How often to check whether the active connection's device-scope relay
+ * token needs renewing while connected. Checking on an interval (rather
+ * than only right after connecting) covers long-lived sessions that
+ * outlast a single token's lifetime.
+ */
+const RELAY_TOKEN_REFRESH_CHECK_MS = 10 * 60 * 1000;
+/** Refresh once less than this much time remains before expiry. */
+const RELAY_TOKEN_REFRESH_MARGIN_MS = 60 * 60 * 1000;
 
 interface SessionSummary {
   id: string;
@@ -86,8 +99,6 @@ app.innerHTML = `
       <section id="device-picker" class="picker" hidden>
         <h2>Known devices</h2>
         <p class="empty">Reconnect to a previously paired mate without scanning a QR code again.</p>
-        <label for="picker-relay-ticket">Relay access ticket</label>
-        <input id="picker-relay-ticket" type="password" required autocomplete="off" />
         <div id="mate-list" class="session-grid"></div>
         <button type="button" id="picker-pair-new" class="ghost">+ Pair a new device</button>
       </section>
@@ -96,8 +107,6 @@ app.innerHTML = `
         <form id="pairing-form">
           <label for="pairing-payload">Pairing payload</label>
           <textarea id="pairing-payload" rows="3" required autocomplete="off"></textarea>
-          <label for="relay-ticket">Relay access ticket</label>
-          <input id="relay-ticket" type="password" required autocomplete="off" />
           <button class="primary" type="submit">Pair securely</button>
         </form>
       </details>
@@ -178,6 +187,7 @@ let activeEpoch = '';
 let nextSequence = 0;
 let sessions: SessionSummary[] = [];
 let focusMode = false;
+let relayTokenRefreshTimer = 0;
 
 let fitFrame = 0;
 const scheduleFit = (): void => {
@@ -282,15 +292,11 @@ document.querySelector<HTMLButtonElement>('#clear-finished')!.addEventListener('
 document.querySelector<HTMLFormElement>('#pairing-form')!.addEventListener('submit', async (event) => {
 	event.preventDefault();
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
-	const relayTicket = document.querySelector<HTMLInputElement>('#relay-ticket')!.value;
 	state.textContent = 'Pairing…';
 	hideBanner();
 	try {
-		const paired = await pairAndConnect(
-			document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value.trim(),
-			relayTicket,
-		);
-		await onConnected(paired, relayTicket);
+		const paired = await pairAndConnect(document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value.trim());
+		await onConnected(paired);
 	} catch (error) {
 		state.textContent = 'Pairing failed';
 		showBanner(error instanceof Error ? error.message : String(error), 'error');
@@ -310,13 +316,16 @@ void refreshDevicePicker();
 // flow: once a secure transport exists, wiring the client up to the UI is
 // identical regardless of how the connection was established.
 //
-// `relayTicket` is also used -- best-effort -- to register this device for
-// Web Push wake notifications. A browser without push support, a denied
-// permission, or an unreachable relay must never affect an otherwise
-// working connection, so that failure is swallowed silently.
-async function onConnected(paired: PairedConnection, relayTicket: string): Promise<void> {
+// `paired.relayToken` -- the device-scope Relay Access Token this
+// connection just authenticated with -- is also used, best-effort, to
+// register this device for Web Push wake notifications. A browser without
+// push support, a denied permission, or an unreachable relay must never
+// affect an otherwise working connection, so that failure is swallowed
+// silently.
+async function onConnected(paired: PairedConnection): Promise<void> {
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
 	axonClient?.close();
+	window.clearInterval(relayTokenRefreshTimer);
 	secureConnection = paired;
 	activeSessionId = '';
 	axonClient = new AxonClient(secureConnection.transport);
@@ -340,10 +349,14 @@ async function onConnected(paired: PairedConnection, relayTicket: string): Promi
 	});
 	state.textContent = 'Encrypted';
 	showBanner(`Paired with ${secureConnection.mateId}.`, 'info');
+	scheduleRelayTokenRefresh(secureConnection.mateId);
 	if (serviceWorkerRegistration && 'PushManager' in window) {
 		void enableWakeNotifications(
 			serviceWorkerRegistration,
-			{ relayUrl: secureConnection.relayUrl, relayTicket, mateId: secureConnection.mateId, deviceId: secureConnection.deviceId },
+			{
+				relayUrl: secureConnection.relayUrl, relayToken: secureConnection.relayToken,
+				mateId: secureConnection.mateId, deviceId: secureConnection.deviceId,
+			},
 			Notification,
 		);
 	}
@@ -354,6 +367,29 @@ async function onConnected(paired: PairedConnection, relayTicket: string): Promi
 	document.querySelector<HTMLElement>('.pairing')!.hidden = true;
 	document.querySelector<HTMLElement>('#device-picker')!.hidden = true;
 	showLanding();
+}
+
+/**
+ * Proactively renews the device-scope relay token before it expires, so a
+ * later reload's reconnect doesn't find a stale or expired token in
+ * mateStore. Checked on an interval rather than scheduled for the exact
+ * expiry time, since the tab can be backgrounded or the connection can
+ * drop and come back in between.
+ */
+function scheduleRelayTokenRefresh(mateId: string): void {
+	const client = axonClient;
+	if (!client) return;
+	const maybeRefresh = async (): Promise<void> => {
+		const mate = await getMate(mateId);
+		if (!mate || mate.relayTokenExpiresAt - Date.now() > RELAY_TOKEN_REFRESH_MARGIN_MS) return;
+		try {
+			await refreshRelayToken(client, mateId);
+		} catch (error) {
+			terminal.writeln(`\r\n\x1b[33mRelay token refresh failed: ${error instanceof Error ? error.message : String(error)}\x1b[0m`);
+		}
+	};
+	void maybeRefresh();
+	relayTokenRefreshTimer = window.setInterval(() => void maybeRefresh(), RELAY_TOKEN_REFRESH_CHECK_MS);
 }
 
 // Shows the device picker when mates are already known, or falls back to
@@ -410,21 +446,16 @@ function renderMateList(mates: PairedMate[]): void {
 }
 
 async function connectToMate(mate: PairedMate, button: HTMLButtonElement): Promise<void> {
-	const ticket = document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value;
-	if (!ticket) {
-		showBanner('Enter the relay access ticket to reconnect.', 'error');
-		return;
-	}
 	const state = document.querySelector<HTMLElement>('#connection-state')!;
 	button.disabled = true;
 	state.textContent = 'Connecting…';
 	hideBanner();
 	try {
-		const paired = await reconnectToMate(mate, ticket);
-		await onConnected(paired, ticket);
+		const paired = await reconnectToMate(mate);
+		await onConnected(paired);
 	} catch (error) {
 		state.textContent = 'Connection failed';
-		if (error instanceof MateKeyMismatchError) {
+		if (error instanceof MateKeyMismatchError || error instanceof RelayTokenExpiredError) {
 			showBanner(`${error.message} Use "Pair a new device" below to continue.`, 'error');
 		} else {
 			showBanner(error instanceof Error ? error.message : String(error), 'error');
@@ -436,9 +467,8 @@ async function connectToMate(mate: PairedMate, button: HTMLButtonElement): Promi
 
 // Forgetting a mate removes its local pairing record. Push-subscription
 // cleanup is best-effort and layered on top -- it must never block or fail
-// the forget action itself. The relay ticket is optional here (the picker
-// field may be empty if the user never typed one for this mate); without
-// it the relay-side DELETE just comes back unauthorized and the row is
+// the forget action itself. mate.relayToken may itself have expired by now;
+// if so the relay-side DELETE just comes back unauthorized and the row is
 // instead pruned the next time the relay gets a 404/410 pushing to it.
 async function forgetMate(mate: PairedMate): Promise<void> {
 	try {
@@ -448,11 +478,10 @@ async function forgetMate(mate: PairedMate): Promise<void> {
 		showBanner(error instanceof Error ? error.message : String(error), 'error');
 	}
 	if (serviceWorkerRegistration && 'PushManager' in window) {
-		const relayTicket = document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value;
 		void currentDeviceId()
 			.then((deviceId) => disableWakeNotifications(
 				serviceWorkerRegistration!,
-				{ relayUrl: mate.relayUrl, relayTicket, mateId: mate.mateId, deviceId },
+				{ relayUrl: mate.relayUrl, relayToken: mate.relayToken, mateId: mate.mateId, deviceId },
 			))
 			.catch(() => {
 				// Best-effort: see the comment above.

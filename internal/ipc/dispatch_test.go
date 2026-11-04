@@ -22,6 +22,23 @@ import (
 	"github.com/SteerMesh/axon/internal/target"
 )
 
+type fakeRevoker struct {
+	mu      sync.Mutex
+	devices []string
+}
+
+func (r *fakeRevoker) Revoke(deviceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.devices = append(r.devices, deviceID)
+}
+
+func (r *fakeRevoker) revoked() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.devices...)
+}
+
 type rpcAdapter struct{ process *rpcProcess }
 
 func (a rpcAdapter) Kind() string { return "rpc" }
@@ -89,7 +106,8 @@ func TestIPCCommandAndSubscriptionMatrix(t *testing.T) {
 	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	server, err := ListenWithOptions(manager, path, Options{Pairing: pairing, Store: persistent})
+	revoker := &fakeRevoker{}
+	server, err := ListenWithOptions(manager, path, Options{Pairing: pairing, Store: persistent, Revoker: revoker})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,6 +141,9 @@ func TestIPCCommandAndSubscriptionMatrix(t *testing.T) {
 	}
 	if err := client.Call("devices.revoke", DeviceRevokeParams{DeviceID: "device"}, nil); err != nil {
 		t.Fatal(err)
+	}
+	if got := revoker.revoked(); len(got) != 1 || got[0] != "device" {
+		t.Fatalf("revoker was not notified, got %v", got)
 	}
 
 	replay, events, cancel, err := client.Subscribe(AttachParams{SessionID: created.ID})

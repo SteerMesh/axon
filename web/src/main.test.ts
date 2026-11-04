@@ -24,9 +24,12 @@ vi.mock('@xterm/addon-fit', () => ({
   },
 }));
 
-const { pairAndConnect, reconnectToMate, MateKeyMismatchError } = vi.hoisted(() => ({
+const {
+  pairAndConnect, reconnectToMate, refreshRelayToken, MateKeyMismatchError, RelayTokenExpiredError,
+} = vi.hoisted(() => ({
   pairAndConnect: vi.fn(),
   reconnectToMate: vi.fn(),
+  refreshRelayToken: vi.fn(),
   MateKeyMismatchError: class MateKeyMismatchError extends Error {
     readonly mateId: string;
 
@@ -36,11 +39,20 @@ const { pairAndConnect, reconnectToMate, MateKeyMismatchError } = vi.hoisted(() 
       this.mateId = mateId;
     }
   },
-}));
-vi.mock('./pairing', () => ({ pairAndConnect, reconnectToMate, MateKeyMismatchError }));
+  RelayTokenExpiredError: class RelayTokenExpiredError extends Error {
+    readonly mateId: string;
 
-const { listMates, deleteMate } = vi.hoisted(() => ({ listMates: vi.fn(), deleteMate: vi.fn() }));
-vi.mock('./mateStore', () => ({ listMates, deleteMate }));
+    constructor(mateId: string) {
+      super(`"${mateId}"'s relay access has expired — re-pair this device to continue.`);
+      this.name = 'RelayTokenExpiredError';
+      this.mateId = mateId;
+    }
+  },
+}));
+vi.mock('./pairing', () => ({ pairAndConnect, reconnectToMate, refreshRelayToken, MateKeyMismatchError, RelayTokenExpiredError }));
+
+const { listMates, deleteMate, getMate } = vi.hoisted(() => ({ listMates: vi.fn(), deleteMate: vi.fn(), getMate: vi.fn() }));
+vi.mock('./mateStore', () => ({ listMates, deleteMate, getMate }));
 
 /**
  * A SecureTransport-shaped fake that replies to every AxonClient request
@@ -84,12 +96,17 @@ function samplePairedMate(overrides: Partial<PairedMate> = {}): PairedMate {
     signingPublicKey: new Uint8Array(32),
     relayUrl: 'wss://relay.example/v1',
     lastConnectedAt: Date.now() - 60_000,
+    relayToken: 'device-relay-token',
+    relayTokenExpiresAt: Date.now() + 60_000,
     ...overrides,
   };
 }
 
 function samplePairedConnection(mateId: string) {
-  return { deviceId: 'device-1', mateId, transport: new AutoReplyTransport() };
+  return {
+    deviceId: 'device-1', mateId, relayUrl: 'wss://relay.example/v1',
+    relayToken: 'device-relay-token', transport: new AutoReplyTransport(),
+  };
 }
 
 function pickerHidden(): boolean {
@@ -133,29 +150,18 @@ describe('device picker', () => {
     expect(cards[1]!.textContent).toContain('mate-2');
   });
 
-  it('refuses to reconnect without a relay access ticket', async () => {
-    listMates.mockResolvedValue([samplePairedMate()]);
-
-    await import('./main');
-    await vi.waitFor(() => expect(pickerHidden()).toBe(false));
-    document.querySelector<HTMLButtonElement>('.mate-card-actions .primary')!.click();
-
-    expect(reconnectToMate).not.toHaveBeenCalled();
-    expect(document.querySelector('#banner')!.textContent).toMatch(/relay access ticket/i);
-  });
-
-  it('reconnects to the chosen mate and proceeds to the landing view', async () => {
+  it('reconnects to the chosen mate without any manual ticket input, and proceeds to the landing view', async () => {
     const mate = samplePairedMate();
     listMates.mockResolvedValue([mate]);
     reconnectToMate.mockResolvedValue(samplePairedConnection(mate.mateId));
 
     await import('./main');
     await vi.waitFor(() => expect(pickerHidden()).toBe(false));
-    document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value = 'ticket-123';
+    expect(document.querySelector('#picker-relay-ticket')).toBeNull();
     document.querySelector<HTMLButtonElement>('.mate-card-actions .primary')!.click();
 
     await vi.waitFor(() => expect(document.querySelector<HTMLElement>('#landing')!.hidden).toBe(false));
-    expect(reconnectToMate).toHaveBeenCalledWith(mate, 'ticket-123');
+    expect(reconnectToMate).toHaveBeenCalledWith(mate);
     expect(pickerHidden()).toBe(true);
     expect(pairingHidden()).toBe(true);
   });
@@ -167,7 +173,6 @@ describe('device picker', () => {
 
     await import('./main');
     await vi.waitFor(() => expect(pickerHidden()).toBe(false));
-    document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value = 'ticket-123';
     document.querySelector<HTMLButtonElement>('.mate-card-actions .primary')!.click();
 
     await vi.waitFor(() => {
@@ -178,6 +183,22 @@ describe('device picker', () => {
     expect(pickerHidden()).toBe(false);
   });
 
+  it('prompts re-pairing with a clear message when the stored relay token has expired', async () => {
+    const mate = samplePairedMate();
+    listMates.mockResolvedValue([mate]);
+    reconnectToMate.mockRejectedValue(new RelayTokenExpiredError(mate.mateId));
+
+    await import('./main');
+    await vi.waitFor(() => expect(pickerHidden()).toBe(false));
+    document.querySelector<HTMLButtonElement>('.mate-card-actions .primary')!.click();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('#banner')!.textContent).toMatch(/relay access has expired/);
+    });
+    expect(document.querySelector('#banner')!.textContent).toMatch(/Pair a new device/);
+    expect(pickerHidden()).toBe(false);
+  });
+
   it('surfaces a plain connection failure (e.g. mate offline) distinctly from a key mismatch', async () => {
     const mate = samplePairedMate();
     listMates.mockResolvedValue([mate]);
@@ -185,7 +206,6 @@ describe('device picker', () => {
 
     await import('./main');
     await vi.waitFor(() => expect(pickerHidden()).toBe(false));
-    document.querySelector<HTMLInputElement>('#picker-relay-ticket')!.value = 'ticket-123';
     document.querySelector<HTMLButtonElement>('.mate-card-actions .primary')!.click();
 
     await vi.waitFor(() => {
@@ -233,12 +253,12 @@ describe('QR pairing form', () => {
     await import('./main');
     await vi.waitFor(() => expect(pairingHidden()).toBe(false));
 
+    expect(document.querySelector('#relay-ticket')).toBeNull();
     document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value = 'encoded-bundle';
-    document.querySelector<HTMLInputElement>('#relay-ticket')!.value = 'relay-ticket-xyz';
     document.querySelector<HTMLButtonElement>('#pairing-form button[type="submit"]')!.click();
 
     await vi.waitFor(() => expect(document.querySelector<HTMLElement>('#landing')!.hidden).toBe(false));
-    expect(pairAndConnect).toHaveBeenCalledWith('encoded-bundle', 'relay-ticket-xyz');
+    expect(pairAndConnect).toHaveBeenCalledWith('encoded-bundle');
     expect(pickerHidden()).toBe(true);
     expect(pairingHidden()).toBe(true);
     expect(document.querySelector('#connection-state')!.textContent).toBe('Encrypted');
@@ -252,10 +272,69 @@ describe('QR pairing form', () => {
     await vi.waitFor(() => expect(pairingHidden()).toBe(false));
 
     document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value = 'encoded-bundle';
-    document.querySelector<HTMLInputElement>('#relay-ticket')!.value = 'relay-ticket-xyz';
     document.querySelector<HTMLButtonElement>('#pairing-form button[type="submit"]')!.click();
 
     await vi.waitFor(() => expect(document.querySelector('#connection-state')!.textContent).toBe('Pairing failed'));
     expect(document.querySelector('#banner')!.textContent).toBe('pairing code has expired');
+  });
+});
+
+// scheduleRelayTokenRefresh is private to main.ts; these drive it the only
+// way a caller can -- through onConnected, reached here via the QR pairing
+// form -- and observe it only through its two visible effects: whether
+// refreshRelayToken gets called, and that nothing it does ever blows up or
+// reaches for a destructive mateStore call.
+describe('relay token refresh scheduling', () => {
+  async function connect(mateId: string): Promise<void> {
+    listMates.mockResolvedValue([]);
+    pairAndConnect.mockResolvedValue(samplePairedConnection(mateId));
+
+    await import('./main');
+    await vi.waitFor(() => expect(pairingHidden()).toBe(false));
+    document.querySelector<HTMLTextAreaElement>('#pairing-payload')!.value = 'encoded-bundle';
+    document.querySelector<HTMLButtonElement>('#pairing-form button[type="submit"]')!.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLElement>('#landing')!.hidden).toBe(false));
+  }
+
+  it('refreshes proactively when the stored token is within the expiry margin', async () => {
+    const mateId = 'mate-margin';
+    // Margin is 60 minutes (RELAY_TOKEN_REFRESH_MARGIN_MS) -- 30 minutes
+    // left is well inside it.
+    getMate.mockResolvedValue(samplePairedMate({ mateId, relayTokenExpiresAt: Date.now() + 30 * 60 * 1000 }));
+    refreshRelayToken.mockResolvedValue(undefined);
+
+    await connect(mateId);
+
+    await vi.waitFor(() => expect(refreshRelayToken).toHaveBeenCalledWith(expect.anything(), mateId));
+  });
+
+  it('does not refresh when the stored token is nowhere near expiring', async () => {
+    const mateId = 'mate-fresh';
+    getMate.mockResolvedValue(samplePairedMate({ mateId, relayTokenExpiresAt: Date.now() + 2 * 24 * 60 * 60 * 1000 }));
+
+    await connect(mateId);
+
+    // getMate resolving is proof the scheduled check actually ran and made
+    // its decision; asserting on refreshRelayToken only after that is what
+    // rules out a refresh this check should not have triggered.
+    await vi.waitFor(() => expect(getMate).toHaveBeenCalledWith(mateId));
+    expect(refreshRelayToken).not.toHaveBeenCalled();
+  });
+
+  it('does not crash or touch mateStore destructively when a scheduled refresh fails', async () => {
+    const mateId = 'mate-refresh-fails';
+    getMate.mockResolvedValue(samplePairedMate({ mateId, relayTokenExpiresAt: Date.now() + 10 * 60 * 1000 }));
+    refreshRelayToken.mockRejectedValue(new Error('relay unreachable'));
+
+    await connect(mateId);
+
+    await vi.waitFor(() => expect(refreshRelayToken).toHaveBeenCalledWith(expect.anything(), mateId));
+    // A failed refresh is surfaced (best-effort) but must never clear or
+    // invalidate the mate's existing record -- main.ts has no call that
+    // would do that; deleteMate is the only destructive mateStore
+    // operation it ever performs, and only from the explicit "Forget"
+    // action, never from a refresh failure.
+    expect(deleteMate).not.toHaveBeenCalled();
+    expect(document.querySelector('#connection-state')!.textContent).toBe('Encrypted');
   });
 });

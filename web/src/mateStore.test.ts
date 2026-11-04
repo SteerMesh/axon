@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { deleteMate, getMate, listMates, type PairedMate, saveMate, touchLastConnected } from './mateStore';
+import { deleteMate, getMate, listMates, type PairedMate, saveMate, touchLastConnected, updateRelayToken } from './mateStore';
 
 let counter = 0;
 // Fresh id per test so tests can run in any order without reading each
@@ -14,6 +14,8 @@ function mate(overrides: Partial<PairedMate> = {}): PairedMate {
     signingPublicKey: new Uint8Array([4, 5, 6, counter]),
     relayUrl: 'wss://relay.example/v1',
     lastConnectedAt: 1_700_000_000_000,
+    relayToken: 'relay-access-token-v1',
+    relayTokenExpiresAt: 1_700_086_400_000,
     ...overrides,
   };
 }
@@ -81,6 +83,23 @@ describe('mateStore', () => {
 
   it('touchLastConnected on an unknown mate is a no-op, not an error', async () => {
     await expect(touchLastConnected('does-not-exist')).resolves.toBeUndefined();
+    await expect(getMate('does-not-exist')).resolves.toBeUndefined();
+  });
+
+  it('updateRelayToken persists a freshly refreshed token and expiry, preserving other fields', async () => {
+    const record = mate({ relayToken: 'old-token', relayTokenExpiresAt: 1000 });
+    await saveMate(record);
+
+    await updateRelayToken(record.mateId, 'new-token', 9000);
+
+    const loaded = await getMate(record.mateId);
+    expect(loaded?.relayToken).toBe('new-token');
+    expect(loaded?.relayTokenExpiresAt).toBe(9000);
+    expect(loaded?.relayUrl).toBe(record.relayUrl);
+  });
+
+  it('updateRelayToken on an unknown mate is a no-op, not an error', async () => {
+    await expect(updateRelayToken('does-not-exist', 'token', 1)).resolves.toBeUndefined();
     await expect(getMate('does-not-exist')).resolves.toBeUndefined();
   });
 });
