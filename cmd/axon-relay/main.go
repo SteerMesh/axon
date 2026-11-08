@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/SteerMesh/axon/internal/relay"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/time/rate"
 )
 
 func main() {
@@ -54,8 +56,9 @@ func main() {
 		}
 	}()
 
+	rateLimitConfig := rateLimitConfigFromEnv()
 	server := &http.Server{
-		Addr: addr, Handler: hub,
+		Addr: addr, Handler: relay.WithRateLimit(hub, rateLimitConfig),
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 70 * time.Second,
 	}
 	slog.Info("Axon Relay listening", "address", addr, "mates", len(mateKeys))
@@ -104,4 +107,46 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// rateLimitConfigFromEnv reads the four rate-limiting tunables, falling
+// back to relay.DefaultRateLimitConfig()'s provisional defaults (burst 5 /
+// 10 per minute on /v1/connect, burst 10 / 20 per minute on
+// /v1/push/subscribe) for any unset or invalid value. The *_RATE_LIMIT vars
+// are expressed as sustained requests per minute (not raw rate.Limit, which
+// is per second) because that is the unit the design doc and this file's
+// own defaults are specified in -- easier for an operator tuning these
+// against axon_relay_rate_limited_total to reason about.
+func rateLimitConfigFromEnv() relay.RateLimitConfig {
+	cfg := relay.DefaultRateLimitConfig()
+	if perMinute, ok := envPositiveInt("AXON_RELAY_CONNECT_RATE_LIMIT"); ok {
+		cfg.ConnectLimit = rate.Limit(float64(perMinute) / 60.0)
+	}
+	if burst, ok := envPositiveInt("AXON_RELAY_CONNECT_RATE_BURST"); ok {
+		cfg.ConnectBurst = burst
+	}
+	if perMinute, ok := envPositiveInt("AXON_RELAY_PUSH_RATE_LIMIT"); ok {
+		cfg.PushSubscribeLimit = rate.Limit(float64(perMinute) / 60.0)
+	}
+	if burst, ok := envPositiveInt("AXON_RELAY_PUSH_RATE_BURST"); ok {
+		cfg.PushSubscribeBurst = burst
+	}
+	return cfg
+}
+
+// envPositiveInt reads key as a positive integer. It reports ok=false (and
+// logs a warning) for an unset, non-numeric, or non-positive value, so
+// callers can fall back to their own default without needing their own
+// validation.
+func envPositiveInt(key string) (int, bool) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return 0, false
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		slog.Warn("Axon Relay ignoring invalid env var, using default", "key", key, "value", raw)
+		return 0, false
+	}
+	return value, true
 }
