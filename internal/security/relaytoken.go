@@ -13,6 +13,29 @@ import (
 // RelayTokenScope identifies what a Relay Access Token (RAT) authorizes.
 type RelayTokenScope string
 
+// Sentinel errors returned by VerifyRelayToken, exported so callers (the
+// relay's metrics instrumentation in particular) can classify a failure by
+// which check rejected it with errors.Is, instead of matching on error text.
+var (
+	// ErrRelayTokenInvalid covers everything about the token's own
+	// encoding and cryptographic validity: malformed base64/JSON, a
+	// signature that doesn't verify, or claims signed for a different
+	// mate_id than the connection claims. All of these mean the same
+	// thing to a caller -- the presented credential doesn't authenticate
+	// as the identity this connection is for -- so they share one
+	// sentinel rather than three.
+	ErrRelayTokenInvalid = errors.New("relay token is malformed or does not verify")
+	// ErrRelayTokenWrongScope means the token verified but its scope
+	// isn't one of the scopes allowed on this connection.
+	ErrRelayTokenWrongScope = errors.New("relay token scope is not permitted on this connection")
+	// ErrRelayTokenDeviceMismatch means the token verified and its scope
+	// is allowed, but it names a different device_id than the connection.
+	ErrRelayTokenDeviceMismatch = errors.New("relay token device_id does not match connection")
+	// ErrRelayTokenExpired means the token verified but its exp claim has
+	// passed.
+	ErrRelayTokenExpired = errors.New("relay token has expired")
+)
+
 const (
 	// RelayScopeMate is minted by a mate for its own relay connection.
 	RelayScopeMate RelayTokenScope = "mate"
@@ -106,7 +129,7 @@ func VerifyRelayToken(token string, mateKey ed25519.PublicKey, wantMateID string
 		return RelayTokenClaims{}, err
 	}
 	if claims.MateID != wantMateID {
-		return RelayTokenClaims{}, errors.New("relay token mate_id does not match connection")
+		return RelayTokenClaims{}, fmt.Errorf("relay token mate_id does not match connection: %w", ErrRelayTokenInvalid)
 	}
 	scopeAllowed := false
 	for _, allowed := range allowedScopes {
@@ -116,13 +139,13 @@ func VerifyRelayToken(token string, mateKey ed25519.PublicKey, wantMateID string
 		}
 	}
 	if !scopeAllowed {
-		return RelayTokenClaims{}, fmt.Errorf("relay token scope %q is not permitted on this connection", claims.Scope)
+		return RelayTokenClaims{}, fmt.Errorf("relay token scope %q is not permitted on this connection: %w", claims.Scope, ErrRelayTokenWrongScope)
 	}
 	if claims.DeviceID != "" && claims.DeviceID != wantDeviceID {
-		return RelayTokenClaims{}, errors.New("relay token device_id does not match connection")
+		return RelayTokenClaims{}, fmt.Errorf("relay token device_id does not match connection: %w", ErrRelayTokenDeviceMismatch)
 	}
 	if now.Unix() >= claims.ExpiresAt {
-		return RelayTokenClaims{}, errors.New("relay token has expired")
+		return RelayTokenClaims{}, fmt.Errorf("relay token has expired: %w", ErrRelayTokenExpired)
 	}
 	return claims, nil
 }
@@ -130,22 +153,22 @@ func VerifyRelayToken(token string, mateKey ed25519.PublicKey, wantMateID string
 func decodeRelayToken(token string, mateKey ed25519.PublicKey) (RelayTokenClaims, error) {
 	parts := strings.SplitN(token, ".", 2)
 	if len(parts) != 2 {
-		return RelayTokenClaims{}, errors.New("malformed relay token")
+		return RelayTokenClaims{}, fmt.Errorf("malformed relay token: %w", ErrRelayTokenInvalid)
 	}
 	body, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return RelayTokenClaims{}, errors.New("malformed relay token claims")
+		return RelayTokenClaims{}, fmt.Errorf("malformed relay token claims: %w", ErrRelayTokenInvalid)
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return RelayTokenClaims{}, errors.New("malformed relay token signature")
+		return RelayTokenClaims{}, fmt.Errorf("malformed relay token signature: %w", ErrRelayTokenInvalid)
 	}
 	if len(mateKey) != ed25519.PublicKeySize || !ed25519.Verify(mateKey, body, signature) {
-		return RelayTokenClaims{}, errors.New("relay token signature is invalid")
+		return RelayTokenClaims{}, fmt.Errorf("relay token signature is invalid: %w", ErrRelayTokenInvalid)
 	}
 	var claims RelayTokenClaims
 	if err := json.Unmarshal(body, &claims); err != nil {
-		return RelayTokenClaims{}, errors.New("malformed relay token claims")
+		return RelayTokenClaims{}, fmt.Errorf("malformed relay token claims: %w", ErrRelayTokenInvalid)
 	}
 	return claims, nil
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/SteerMesh/axon/internal/relay"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -41,6 +42,18 @@ func main() {
 	case vapidPublicKey != "" || vapidPrivateKey != "":
 		slog.Warn("AXON_RELAY_VAPID_PUBLIC_KEY and AXON_RELAY_VAPID_PRIVATE_KEY must both be set; push notifications disabled")
 	}
+	metricsAddr := envOr("AXON_RELAY_METRICS_ADDR", "127.0.0.1:9090")
+	metricsServer := &http.Server{
+		Addr: metricsAddr, Handler: promhttp.Handler(),
+		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 70 * time.Second,
+	}
+	go func() {
+		slog.Info("Axon Relay metrics listening", "address", metricsAddr)
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Axon Relay metrics server stopped", "error", err)
+		}
+	}()
+
 	server := &http.Server{
 		Addr: addr, Handler: hub,
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 70 * time.Second,

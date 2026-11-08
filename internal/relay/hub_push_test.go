@@ -17,7 +17,29 @@ import (
 	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/SteerMesh/axon/internal/security"
 	"github.com/coder/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// waitForCounterDelta polls counter (a single-label-value Counter obtained
+// via WithLabelValues) until it reaches baseline+delta, or fails the test.
+// notify() runs in a goroutine spawned by triggerPush, so the metric
+// increment races with the test goroutine's own progress -- polling with a
+// timeout, rather than asserting immediately after a channel receive or a
+// fixed sleep, is what makes these assertions deterministic instead of
+// occasionally flaky.
+func waitForCounterDelta(t *testing.T, counter prometheus.Counter, baseline, delta float64) {
+	t.Helper()
+	want := baseline + delta
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := testutil.ToFloat64(counter); got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("counter = %v, want %v", testutil.ToFloat64(counter), want)
+}
 
 func newTestSubscriptionStore(t *testing.T) *SubscriptionStore {
 	t.Helper()
@@ -430,6 +452,7 @@ func TestHubTriggerPushDeletesSubscriptionOnGoneResponse(t *testing.T) {
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
 		return fakeResponse(http.StatusGone), nil
 	}
+	prunedBefore := testutil.ToFloat64(pushTotal.WithLabelValues("pruned"))
 
 	hub.triggerPush(RouteFrame{MateID: "mate-1", To: "device-1"})
 
@@ -439,6 +462,7 @@ func TestHubTriggerPushDeletesSubscriptionOnGoneResponse(t *testing.T) {
 		if _, err := store.Get(context.Background(), "mate-1", "device-1"); err != nil {
 			lastErr = err
 			if errors.Is(err, sql.ErrNoRows) {
+				waitForCounterDelta(t, pushTotal.WithLabelValues("pruned"), prunedBefore, 1)
 				return
 			}
 		}
@@ -460,12 +484,14 @@ func TestHubTriggerPushDeletesSubscriptionOnNotFoundResponse(t *testing.T) {
 	hub.push.send = func(ctx context.Context, message []byte, s *webpush.Subscription, options *webpush.Options) (*http.Response, error) {
 		return fakeResponse(http.StatusNotFound), nil
 	}
+	prunedBefore := testutil.ToFloat64(pushTotal.WithLabelValues("pruned"))
 
 	hub.triggerPush(RouteFrame{MateID: "mate-1", To: "device-1"})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := store.Get(context.Background(), "mate-1", "device-1"); errors.Is(err, sql.ErrNoRows) {
+			waitForCounterDelta(t, pushTotal.WithLabelValues("pruned"), prunedBefore, 1)
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -488,6 +514,7 @@ func TestHubTriggerPushKeepsSubscriptionOnSuccess(t *testing.T) {
 		defer close(done)
 		return fakeResponse(http.StatusCreated), nil
 	}
+	sentBefore := testutil.ToFloat64(pushTotal.WithLabelValues("sent"))
 
 	hub.triggerPush(RouteFrame{MateID: "mate-1", To: "device-1"})
 
@@ -496,7 +523,7 @@ func TestHubTriggerPushKeepsSubscriptionOnSuccess(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("push was not attempted")
 	}
-	time.Sleep(20 * time.Millisecond)
+	waitForCounterDelta(t, pushTotal.WithLabelValues("sent"), sentBefore, 1)
 	if _, err := store.Get(context.Background(), "mate-1", "device-1"); err != nil {
 		t.Fatalf("subscription should survive a successful push: %v", err)
 	}
@@ -517,6 +544,7 @@ func TestHubTriggerPushIgnoresSendError(t *testing.T) {
 		defer close(done)
 		return nil, errors.New("push service unreachable")
 	}
+	failedBefore := testutil.ToFloat64(pushTotal.WithLabelValues("failed"))
 
 	hub.triggerPush(RouteFrame{MateID: "mate-1", To: "device-1"})
 
@@ -525,9 +553,9 @@ func TestHubTriggerPushIgnoresSendError(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("push send was not attempted")
 	}
+	waitForCounterDelta(t, pushTotal.WithLabelValues("failed"), failedBefore, 1)
 	// A transient send error must not drop the subscription -- only a
 	// 404/410 response from the push service does that.
-	time.Sleep(20 * time.Millisecond)
 	if _, err := store.Get(context.Background(), "mate-1", "device-1"); err != nil {
 		t.Fatalf("subscription should survive a transient send error: %v", err)
 	}
