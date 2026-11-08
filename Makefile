@@ -1,8 +1,11 @@
 .PHONY: build test test-race coverage vet fmt web-build web-test check
 
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.version=$(VERSION)
+
 build:
 	mkdir -p bin
-	go build -o bin/mesh-axon ./cmd/mesh-axon
+	go build -ldflags "$(LDFLAGS)" -o bin/mesh-axon ./cmd/mesh-axon
 	go build -o bin/axon-relay ./cmd/axon-relay
 
 test:

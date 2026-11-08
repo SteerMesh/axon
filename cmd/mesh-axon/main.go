@@ -34,6 +34,18 @@ import (
 
 var socketPath string
 
+// version is overridden at build time via:
+//
+//	go build -ldflags "-X main.version=$(VERSION)" ./cmd/mesh-axon
+//
+// See the Makefile's build target. Printed by `mesh-axon version` and
+// `mesh-axon --version` as "mesh-axon <version>", which is exactly the
+// format mesh's AxonVersion() prober (internal/ops/axon_install.go in
+// github.com/SteerMesh/mesh) expects: it tries the "version" subcommand
+// then the "--version" flag, and strips a "mesh-axon " prefix from
+// whichever one answers first.
+var version = "dev"
+
 func main() {
 	path, err := ipc.DefaultSocketPath()
 	if err != nil {
@@ -51,12 +63,27 @@ func newRoot(defaultSocket string) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "mesh-axon",
 		Short:         "Secure remote access to Mesh-managed sessions",
+		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	// Matches mesh's AxonVersion() prober exactly: "<name> <version>", not
+	// cobra's default "<name> version <version>".
+	root.SetVersionTemplate("{{.Name}} {{.Version}}\n")
 	root.PersistentFlags().StringVar(&socketPath, "socket", defaultSocket, "Axon Agent Unix socket")
-	root.AddCommand(newServeCommand(), newRunCommand(), newSessionsCommand(), newAttachCommand(), newSignalCommand(), newStatusCommand(), newServiceCommand(), newPairCommand(), newDevicesCommand(), newIdentityCommand())
+	root.AddCommand(newServeCommand(), newRunCommand(), newSessionsCommand(), newAttachCommand(), newSignalCommand(), newStatusCommand(), newServiceCommand(), newPairCommand(), newDevicesCommand(), newIdentityCommand(), newVersionCommand())
 	return root
+}
+
+func newVersionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the mesh-axon version",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := fmt.Println("mesh-axon " + version)
+			return err
+		},
+	}
 }
 
 func newServeCommand() *cobra.Command {
