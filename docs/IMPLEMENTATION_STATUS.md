@@ -48,6 +48,14 @@ protocol validation, but it is not yet a production release.
   (see `docs/PROTOCOL.md`) before it expires. `devices.revoke` also now
   drops the device's live channel immediately rather than only via token
   expiry.
+- Prometheus metrics (`internal/relay/metrics.go`) for `axon-relay`, served
+  loopback-only by default on a separate port (`AXON_RELAY_METRICS_ADDR`,
+  default `127.0.0.1:9090`) from the main connect port.
+- Per-source-IP rate limiting (`internal/relay/ratelimit.go`) on
+  `/v1/connect` and the push-subscribe REST calls, keyed on `r.RemoteAddr`.
+- Docker and systemd deployment artifacts for `axon-relay`
+  (`deploy/axon-relay/`): a distroless multi-stage Dockerfile,
+  `docker-compose.yml`, and an `axon-relay.service` unit.
 
 ## Required upgrade action
 
@@ -73,7 +81,8 @@ deployments.
 
 ## Production hardening remaining
 
-- Add deployment manifests, relay rate limits, metrics, and operational alerts.
+- Define operational alerts; deferred until the metrics above have
+  captured real production traffic to set sane thresholds against.
 - Complete native-client hardware-backed presence assertions if biometric
   confirmation is required.
 
