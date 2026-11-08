@@ -262,14 +262,40 @@ func (h *Hub) verifyRelayAccessToken(r *http.Request, mateID string, allowedScop
 	mateKey, known := h.mateKeys[mateID]
 	h.mu.RUnlock()
 	if !known {
+		authFailures.WithLabelValues("unknown_mate").Inc()
 		return false
 	}
 	token := bearerToken(r)
 	if token == "" {
+		authFailures.WithLabelValues("bad_signature").Inc()
 		return false
 	}
 	_, err := security.VerifyRelayToken(token, mateKey, mateID, allowedScopes, deviceID, time.Now())
-	return err == nil
+	if err != nil {
+		authFailures.WithLabelValues(authFailureReason(err)).Inc()
+		return false
+	}
+	return true
+}
+
+// authFailureReason maps a security.VerifyRelayToken error to the metric
+// label for axon_relay_auth_failures_total. It mirrors that function's own
+// branches exactly (see relaytoken.go) via errors.Is against its exported
+// sentinels, rather than inventing categories the code can't actually
+// produce.
+func authFailureReason(err error) string {
+	switch {
+	case errors.Is(err, security.ErrRelayTokenWrongScope):
+		return "wrong_scope"
+	case errors.Is(err, security.ErrRelayTokenDeviceMismatch):
+		return "device_id_mismatch"
+	case errors.Is(err, security.ErrRelayTokenExpired):
+		return "expired"
+	default:
+		// security.ErrRelayTokenInvalid, or anything else unrecognized --
+		// the token's own encoding/signature/identity didn't check out.
+		return "bad_signature"
+	}
 }
 
 // bearerToken reads the RAT from the Authorization header (used by the
@@ -300,6 +326,7 @@ func (h *Hub) register(p *peer) error {
 			return errors.New("mate is already connected")
 		}
 		h.mates[p.mateID] = p
+		connectionsActive.WithLabelValues(p.role).Inc()
 		return nil
 	}
 	if h.devices[p.mateID] == nil {
@@ -309,6 +336,7 @@ func (h *Hub) register(p *peer) error {
 		return errors.New("device is already connected")
 	}
 	h.devices[p.mateID][p.deviceID] = p
+	connectionsActive.WithLabelValues(p.role).Inc()
 	return nil
 }
 
@@ -318,6 +346,7 @@ func (h *Hub) unregister(p *peer) {
 	if p.role == "mate" {
 		if h.mates[p.mateID] == p {
 			delete(h.mates, p.mateID)
+			connectionsActive.WithLabelValues(p.role).Dec()
 		}
 		return
 	}
@@ -326,6 +355,7 @@ func (h *Hub) unregister(p *peer) {
 		if len(devices) == 0 {
 			delete(h.devices, p.mateID)
 		}
+		connectionsActive.WithLabelValues(p.role).Dec()
 	}
 }
 
@@ -366,6 +396,7 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 			_ = source.conn.Close(websocket.StatusPolicyViolation, "invalid routing frame")
 			return
 		}
+		frameBytes.Observe(float64(len(data)))
 		if source.role == "device" {
 			frame.From = source.deviceID
 			frame.To = "mate"
@@ -380,9 +411,11 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 		target := h.target(frame)
 		if target == nil {
 			if source.role == "device" {
+				framesTotal.WithLabelValues("dropped_no_peer").Inc()
 				_ = source.conn.Close(websocket.StatusTryAgainLater, "mate unavailable")
 				return
 			}
+			framesTotal.WithLabelValues("woken_via_push").Inc()
 			h.triggerPush(frame)
 			continue
 		}
@@ -390,7 +423,9 @@ func (h *Hub) readLoop(ctx context.Context, source *peer) {
 		writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err = target.write(writeCtx, forwarded)
 		cancel()
-		if err != nil {
+		if err == nil {
+			framesTotal.WithLabelValues("delivered").Inc()
+		} else {
 			slog.Warn("Relay target delivery failed",
 				"source_role", source.role,
 				"mate_id", source.mateID,
@@ -463,15 +498,19 @@ func (p *pushConfig) notify(ctx context.Context, mateID, deviceID string) {
 		TTL:             60,
 	})
 	if err != nil {
+		pushTotal.WithLabelValues("failed").Inc()
 		slog.Warn("Axon Relay failed to send push notification", "error", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		pushTotal.WithLabelValues("pruned").Inc()
 		if err := p.store.Delete(ctx, mateID, deviceID); err != nil {
 			slog.Warn("Axon Relay failed to delete dead push subscription", "error", err)
 		}
+		return
 	}
+	pushTotal.WithLabelValues("sent").Inc()
 }
 
 func (h *Hub) MateConnected(mateID string) bool {
