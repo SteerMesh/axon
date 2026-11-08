@@ -88,6 +88,12 @@ export AXON_RELAY_MATE_KEYS="laptop=AbCdEf...=="
 ./bin/axon-relay
 ```
 
+Running this by hand is fine for trying things out locally. For an
+actual self-hosted deployment (a server or VPS the relay stays up on),
+see `deploy/axon-relay/README.md` for a Docker Compose setup and a
+systemd unit, both covering the same environment variables above plus
+state/update/restart mechanics.
+
 ## Step 3 — start the mate
 
 On the machine that will own your terminal sessions:

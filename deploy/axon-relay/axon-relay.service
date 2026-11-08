@@ -1,0 +1,59 @@
+# System-level (not --user) systemd unit for axon-relay.
+#
+# This is deliberately separate from mesh-axon's per-user service story
+# (internal/service/install.go, which installs a --user systemd unit /
+# LaunchAgent for the mate). axon-relay runs unattended on a server or VPS
+# with no logged-in session, so it needs a system-level unit tied to a
+# dedicated system user instead -- a different lifecycle from a personal
+# background agent that comes and goes with a desktop login session.
+#
+# Install (see README.md for the full walkthrough):
+#   1. Create the dedicated system user (no login shell, no home dir login):
+#        sudo useradd --system --no-create-home --shell /usr/sbin/nologin axon-relay
+#   2. Install the binary:
+#        sudo install -m 0755 bin/axon-relay /usr/local/bin/axon-relay
+#   3. Create the state directory and env file:
+#        sudo mkdir -p /var/lib/axon-relay /etc/axon-relay
+#        sudo chown axon-relay:axon-relay /var/lib/axon-relay
+#        sudo touch /etc/axon-relay/env
+#        sudo chmod 640 /etc/axon-relay/env
+#        sudo chown root:axon-relay /etc/axon-relay/env
+#   4. Put at least AXON_RELAY_MATE_KEYS=... into /etc/axon-relay/env.
+#   5. Install and enable this unit:
+#        sudo cp deploy/axon-relay/axon-relay.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now axon-relay
+
+[Unit]
+Description=Axon Relay
+Documentation=https://github.com/SteerMesh/axon/blob/bootstrap/docs/GETTING_STARTED.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=axon-relay
+Group=axon-relay
+ExecStart=/usr/local/bin/axon-relay
+WorkingDirectory=/var/lib/axon-relay
+EnvironmentFile=/etc/axon-relay/env
+Restart=on-failure
+RestartSec=5
+
+# Hardening. axon-relay only needs network access and its one state
+# directory (for the push-subscription SQLite store); everything else
+# below is safe to lock down.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/axon-relay
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

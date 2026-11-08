@@ -1,0 +1,82 @@
+# docker-compose.yml for self-hosting a single axon-relay instance.
+#
+# Intended audience: a solo operator or small team running their own
+# relay, not a managed/multi-tenant service -- see deploy/axon-relay/README.md.
+#
+# Usage (from this directory):
+#   cp .env.example .env   # fill in AXON_RELAY_MATE_KEYS at minimum
+#   docker compose up -d
+#   docker compose logs -f axon-relay
+
+services:
+  axon-relay:
+    build:
+      context: ../..
+      dockerfile: deploy/axon-relay/Dockerfile
+    # If you'd rather pull a pre-built image from a registry instead of
+    # building locally on the host, comment out `build:` above and use
+    # `image: your-registry/axon-relay:tag` instead. This repo does not
+    # publish one itself (no CI/CD push pipeline exists yet -- see
+    # README.md's "Possible follow-ups" note).
+    container_name: axon-relay
+    restart: unless-stopped
+    environment:
+      # Required: comma-separated mate_id=base64url-ed25519-public-key
+      # pairs. See README.md for how to generate one.
+      AXON_RELAY_MATE_KEYS: "${AXON_RELAY_MATE_KEYS}"
+      # Listen address for the main connect endpoint, inside the
+      # container. Leave at :8080 and use the `ports:` mapping below to
+      # control host-side exposure.
+      AXON_RELAY_ADDR: ":8080"
+      # Metrics/health address inside the container. This is deliberately
+      # bound to 0.0.0.0 here (not the relay's own 127.0.0.1 default) so
+      # Docker's port-forwarding can reach it at all -- a process bound to
+      # 127.0.0.1 inside a container's network namespace is unreachable
+      # via `docker run -p`/compose port mapping, which targets the
+      # container's external interface, not its loopback. The equivalent
+      # "metrics stay local-only" protection is reinstated on the HOST
+      # side instead, by binding the published port to 127.0.0.1 below --
+      # see the `ports:` comment.
+      AXON_RELAY_METRICS_ADDR: "0.0.0.0:9090"
+      # Optional. Uncomment and set in .env to enable Web Push wake
+      # notifications (both keys must be set together).
+      AXON_RELAY_VAPID_PUBLIC_KEY: "${AXON_RELAY_VAPID_PUBLIC_KEY:-}"
+      AXON_RELAY_VAPID_PRIVATE_KEY: "${AXON_RELAY_VAPID_PRIVATE_KEY:-}"
+      # Optional. Comma-separated allowed WebSocket origins.
+      AXON_RELAY_ORIGINS: "${AXON_RELAY_ORIGINS:-}"
+      # Optional rate-limit tunables (requests/minute and burst size). See
+      # internal/relay/ratelimit.go and cmd/axon-relay/main.go for defaults
+      # if these are left unset.
+      AXON_RELAY_CONNECT_RATE_LIMIT: "${AXON_RELAY_CONNECT_RATE_LIMIT:-}"
+      AXON_RELAY_CONNECT_RATE_BURST: "${AXON_RELAY_CONNECT_RATE_BURST:-}"
+      AXON_RELAY_PUSH_RATE_LIMIT: "${AXON_RELAY_PUSH_RATE_LIMIT:-}"
+      AXON_RELAY_PUSH_RATE_BURST: "${AXON_RELAY_PUSH_RATE_BURST:-}"
+      # Path to the push-subscription SQLite store. Points inside the
+      # named volume mounted below so it survives container restarts and
+      # recreates.
+      AXON_RELAY_DB_PATH: "/var/lib/axon-relay/axon-relay.db"
+    ports:
+      # Main connect endpoint (WebSocket upgrade for mates/devices, plus
+      # /healthz). Exposed on all host interfaces by default since mates
+      # and devices typically connect from off-box; narrow this to a
+      # specific host IP (e.g. "203.0.113.5:8080:8080") if you're fronting
+      # this with a reverse proxy/TLS terminator instead of exposing it
+      # directly.
+      - "8080:8080"
+      # Metrics + health (Prometheus /metrics). Bound to the host's
+      # loopback only, matching axon-relay's own AXON_RELAY_METRICS_ADDR
+      # default of 127.0.0.1:9090 when run outside a container -- scraping
+      # from another host requires an explicit SSH tunnel or a reverse
+      # proxy you control, not a wide-open port.
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - axon-relay-data:/var/lib/axon-relay
+    # No `healthcheck:` block here: the runtime image is distroless (no
+    # shell, no curl/wget) so there's no binary available to script an
+    # HTTP check with from inside the container. Verify liveness from the
+    # host instead:
+    #   curl -fsS http://localhost:8080/healthz
+    #   curl -fsS http://127.0.0.1:9090/metrics
+
+volumes:
+  axon-relay-data:
