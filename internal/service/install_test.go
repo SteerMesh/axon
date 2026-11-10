@@ -18,7 +18,7 @@ func TestInstallForSupportedPlatforms(t *testing.T) {
 	} {
 		t.Run(test.goos, func(t *testing.T) {
 			home := t.TempDir()
-			path, err := installForOS(test.goos, "/bin/a&b", home)
+			path, err := installForOS(test.goos, "/bin/a&b", home, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -38,7 +38,7 @@ func TestInstallForSupportedPlatforms(t *testing.T) {
 }
 
 func TestInstallRejectsUnsupportedPlatformAndWriteFailure(t *testing.T) {
-	if _, err := installForOS("plan9", "axon", t.TempDir()); err == nil {
+	if _, err := installForOS("plan9", "axon", t.TempDir(), nil); err == nil {
 		t.Fatal("unsupported platform accepted")
 	}
 	parent := filepath.Join(t.TempDir(), "file")
@@ -62,3 +62,66 @@ func TestInstallUsesCurrentPlatform(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestInstallForSupportedPlatformsOmitsRelayWhenUnset(t *testing.T) {
+	home := t.TempDir()
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			path, err := installForOS(goos, "/bin/axon", home, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := string(data)
+			if strings.Contains(body, "AXON_RELAY_URL") {
+				t.Fatalf("unexpected relay env in %q", body)
+			}
+		})
+	}
+}
+
+func TestInstallEmbedsRelayURLWhenSet(t *testing.T) {
+	env := map[string]string{"AXON_RELAY_URL": "wss://relay.example/ws"}
+	home := t.TempDir()
+
+	t.Run("darwin", func(t *testing.T) {
+		path, err := installForOS("darwin", "/bin/axon", home, env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		for _, want := range []string{
+			"<key>EnvironmentVariables</key>",
+			"<key>AXON_RELAY_URL</key>",
+			"<string>wss://relay.example/ws</string>",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("missing %q in:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("linux", func(t *testing.T) {
+		path, err := installForOS("linux", "/bin/axon", home, env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		want := "Environment=AXON_RELAY_URL=wss://relay.example/ws"
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in:\n%s", want, body)
+		}
+	})
+}
+
