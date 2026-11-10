@@ -56,6 +56,22 @@ protocol validation, but it is not yet a production release.
 - Docker and systemd deployment artifacts for `axon-relay`
   (`deploy/axon-relay/`): a distroless multi-stage Dockerfile,
   `docker-compose.yml`, and an `axon-relay.service` unit.
+- Repeatable release automation (`.goreleaser.yaml`,
+  `.github/workflows/release.yml`): pushing a `v*` tag builds `mesh-axon`
+  for darwin/linux (amd64 and arm64) and `axon-relay` for darwin/linux/windows
+  (amd64 and arm64, minus windows/arm64), then publishes them as GitHub
+  release assets, each binary paired with its own `<asset>.sha256` sidecar
+  file -- the exact contract `axonInstallFromGitHub` in
+  `github.com/SteerMesh/mesh`'s `internal/ops/axon_install.go` expects when
+  it falls back to downloading `mesh-axon` from this repo's releases.
+  `mesh-axon` is not built for windows: `internal/target`'s PTY adapters
+  (`command_unix.go`, `shell.go`) are unix-only (`//go:build unix`), so
+  `cmd/mesh-axon` does not currently compile for `GOOS=windows` --
+  unrelated to release tooling, and not addressed here. **No release has
+  been tagged yet**: this only lands the automation itself. Cutting the
+  first `v*` tag is a separate, explicit next step (see
+  `docs/GETTING_STARTED.md`'s note on the `mesh mates install axon`
+  fallback having nothing to find until that happens).
 
 ## Required upgrade action
 

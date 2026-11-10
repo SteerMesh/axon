@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        id: goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # mesh's install fallback (axonInstallFromGitHub in
+      # github.com/SteerMesh/mesh's internal/ops/axon_install.go) downloads
+      # each binary asset plus a SEPARATE "<asset>.sha256" sidecar via
+      # `gh release download --pattern`. GoReleaser's own `checksum:` block
+      # only produces one combined checksums.txt covering every asset,
+      # which that lookup can't use -- there's no OSS GoReleaser hook stage
+      # that runs after archives are named but before release publish
+      # where individually named per-asset sidecars could be generated and
+      # attached as extra_files. So this step computes and uploads them
+      # itself, using the exact same tag GoReleaser released against.
+      #
+      # dist/artifacts.json records the authoritative release-asset
+      # name -> on-disk path mapping GoReleaser just used to publish (the
+      # on-disk files are NOT renamed to their release-asset name -- they
+      # stay nested under their original build-stage path, e.g.
+      # dist/mesh-axon_darwin_amd64_v1/mesh-axon). The entries with
+      # extra.Format == "binary" are exactly the ones published as release
+      # assets under archives' name_template (verified locally with
+      # `goreleaser release --snapshot --clean` against this same config).
+      - name: Generate and upload per-asset checksum sidecars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/sha256
+          count=0
+          while IFS=$'\t' read -r name path; do
+            sha256sum "$path" | awk -v n="$name" '{print $1 "  " n}' > "dist/sha256/${name}.sha256"
+            echo "generated ${name}.sha256 (from ${path})"
+            count=$((count + 1))
+          done < <(jq -r '.[] | select(.extra.Format == "binary") | "\(.name)\t\(.path)"' dist/artifacts.json)
+          if [ "$count" -eq 0 ]; then
+            echo "no binary release artifacts found in dist/artifacts.json" >&2
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" dist/sha256/*.sha256 --clobber --repo "${GITHUB_REPOSITORY}"
