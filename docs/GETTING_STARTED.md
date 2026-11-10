@@ -25,6 +25,43 @@ make build
 This produces `bin/mesh-axon` (the host-side agent and CLI) and
 `bin/axon-relay` (the relay server).
 
+## Recommended: `mesh remote up`
+
+If you have the `mesh` CLI, that wrapper is the entry point. It starts
+the mate, requires a relay you run yourself, and prints a pairing QR.
+
+```bash
+mesh remote set-relay ws://127.0.0.1:8080
+mesh remote up
+mesh remote pair
+```
+
+When `axon-relay` is already built (`make build` above, or on `PATH`,
+or next to `mesh-axon`), one command starts the relay on
+`127.0.0.1:8080` and the mate:
+
+```bash
+mesh remote up --local-relay
+mesh remote pair
+```
+
+From inside mesh chat you can also run **`/remote`** (pairing text only) or start with
+**`mesh chat --remote`** to attach through `mesh-axon` over local IPC; neither replaces a
+relay for phone/PWA attach.
+
+`--local-relay` uses the mate-keys fragment from `mesh-axon identity`.
+Mesh does not download a relay. If `axon-relay` is not installed, the
+command tells you to build it (`make build`, or `deploy/axon-relay`)
+instead of fetching one.
+
+The steps below are the same flow without the wrapper: identity, a
+relay you start, then `mesh-axon serve` and `pair`.
+
+**Phase 2 is not implemented.** There is no hosted relay at
+`wss://relay.steermesh.dev`, no mate-key enrollment API, and no hosted
+PWA. Those are not defaults. Use a relay you run, including the local
+one `--local-relay` starts.
+
 ## Step 1 — get your mate's identity
 
 Before anything else, a mate (the machine that will own your terminal
@@ -125,6 +162,19 @@ With the `mesh` wrapper:
 mesh axon serve --relay-url wss://relay.example.com
 ```
 
+**Keep the mate running after logout (advanced).** Install a per-user service so `serve`
+starts on login. Relay URL for the service is taken from `--relay-url` when you install, or
+from `$AXON_RELAY_URL` in the shell (same default as the flag):
+
+```bash
+export AXON_RELAY_URL=wss://relay.example.com
+./bin/mesh-axon service install
+# or: mesh axon service install --relay-url wss://relay.example.com
+```
+
+On macOS this bootstraps a launchd agent; on Linux, a user systemd unit. Both embed
+`AXON_RELAY_URL` when set. You still need a reachable relay (Steps 2–3 or `mesh remote up`).
+
 ## Step 4 — pair a device via the PWA
 
 On the mate, issue a one-time pairing code:
@@ -222,6 +272,10 @@ invariant: it can tell a device to come back online without learning or
 leaking anything about what it's coming back online *for*.
 
 ## Alternative entry point: `mesh axon`
+
+Prefer `mesh remote` (see "Recommended: `mesh remote up`" above) when
+you want mesh to start the mate and, with `--local-relay`, a local
+relay. `mesh axon` stays a passthrough.
 
 Every `mesh-axon` subcommand above is also available as `mesh axon
 <subcommand>` if you're running it through the `mesh` CLI instead of the

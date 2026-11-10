@@ -299,7 +299,8 @@ func newStatusCommand() *cobra.Command {
 
 func newServiceCommand() *cobra.Command {
 	serviceCommand := &cobra.Command{Use: "service", Short: "Manage the Axon Agent service"}
-	serviceCommand.AddCommand(&cobra.Command{
+	var relayURL string
+	installCmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install a per-user launchd or systemd service",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -315,7 +316,11 @@ func newServiceCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			path, err := serviceinstaller.Install(executable, home)
+			var env map[string]string
+			if relayURL != "" {
+				env = map[string]string{"AXON_RELAY_URL": relayURL}
+			}
+			path, err := serviceinstaller.InstallWithEnv(executable, home, env)
 			if err != nil {
 				return err
 			}
@@ -325,7 +330,9 @@ func newServiceCommand() *cobra.Command {
 			}
 			return exec.Command("systemctl", "--user", "enable", "--now", "mesh-axon.service").Run()
 		},
-	})
+	}
+	installCmd.Flags().StringVar(&relayURL, "relay-url", os.Getenv("AXON_RELAY_URL"), "Axon Relay URL (embedded in service environment)")
+	serviceCommand.AddCommand(installCmd)
 	return serviceCommand
 }
 
