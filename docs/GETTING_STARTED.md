@@ -45,6 +45,10 @@ mesh remote up --local-relay
 mesh remote pair
 ```
 
+From inside mesh chat you can also run **`/remote`** (pairing text only) or start with
+**`mesh chat --remote`** to attach through `mesh-axon` over local IPC; neither replaces a
+relay for phone/PWA attach.
+
 `--local-relay` uses the mate-keys fragment from `mesh-axon identity`.
 Mesh does not download a relay. If `axon-relay` is not installed, the
 command tells you to build it (`make build`, or `deploy/axon-relay`)
@@ -157,6 +161,19 @@ With the `mesh` wrapper:
 ```bash
 mesh axon serve --relay-url wss://relay.example.com
 ```
+
+**Keep the mate running after logout (advanced).** Install a per-user service so `serve`
+starts on login. Relay URL for the service is taken from `--relay-url` when you install, or
+from `$AXON_RELAY_URL` in the shell (same default as the flag):
+
+```bash
+export AXON_RELAY_URL=wss://relay.example.com
+./bin/mesh-axon service install
+# or: mesh axon service install --relay-url wss://relay.example.com
+```
+
+On macOS this bootstraps a launchd agent; on Linux, a user systemd unit. Both embed
+`AXON_RELAY_URL` when set. You still need a reachable relay (Steps 2–3 or `mesh remote up`).
 
 ## Step 4 — pair a device via the PWA
 
